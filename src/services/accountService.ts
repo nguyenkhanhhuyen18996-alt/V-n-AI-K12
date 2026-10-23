@@ -1,0 +1,786 @@
+import {
+  UserAccount,
+  StudentSurveyData,
+  ReadingAttempt,
+  WritingSubmissionRecord,
+  TeacherRegistrationRecord,
+  TeacherVerificationMethod,
+  ClassroomRecord,
+  AdminOverviewData
+} from '../types';
+
+const STORAGE_KEY_SESSION_USER = 'vanai12_active_session_user_v2';
+const STORAGE_KEY_SESSION_TOKEN = 'vanai12_active_session_token_v2';
+const STORAGE_KEY_ADMIN_SIG = 'vanai12_active_admin_sig_v2';
+
+let cachedAccounts: UserAccount[] = [];
+let cachedClasses: ClassroomRecord[] = [];
+
+export function getActiveSessionToken(): string | null {
+  try {
+    return sessionStorage.getItem(STORAGE_KEY_SESSION_TOKEN);
+  } catch {
+    return null;
+  }
+}
+
+export function getActiveAdminSignature(): string | null {
+  try {
+    return sessionStorage.getItem(STORAGE_KEY_ADMIN_SIG);
+  } catch {
+    return null;
+  }
+}
+
+export function saveAuthSession(
+  user: UserAccount | null,
+  token?: string | null,
+  adminSig?: string | null
+): void {
+  try {
+    if (user && token) {
+      sessionStorage.setItem(STORAGE_KEY_SESSION_USER, JSON.stringify(user));
+      sessionStorage.setItem(STORAGE_KEY_SESSION_TOKEN, token);
+      sessionStorage.setItem('vanai12_active_user_id_v2', user.id);
+      if (adminSig) {
+        sessionStorage.setItem(STORAGE_KEY_ADMIN_SIG, adminSig);
+      } else {
+        sessionStorage.removeItem(STORAGE_KEY_ADMIN_SIG);
+      }
+    } else {
+      sessionStorage.removeItem(STORAGE_KEY_SESSION_USER);
+      sessionStorage.removeItem(STORAGE_KEY_SESSION_TOKEN);
+      sessionStorage.removeItem(STORAGE_KEY_ADMIN_SIG);
+      sessionStorage.removeItem('vanai12_active_user_id_v2');
+    }
+  } catch (err) {
+    console.warn('Lỗi lưu phiên đăng nhập:', err);
+  }
+}
+
+export function getSavedSessionUser(): UserAccount | null {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEY_SESSION_USER);
+    const token = sessionStorage.getItem(STORAGE_KEY_SESSION_TOKEN);
+    if (!raw || !token) return null;
+    return JSON.parse(raw) as UserAccount;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Kiểm tra quyền Quản trị viên từ phiên xác thực đáng tin cậy
+ */
+export function isVerifiedAdminSession(): boolean {
+  const user = getSavedSessionUser();
+  const token = getActiveSessionToken();
+  return Boolean(user && user.role === 'admin' && user.status === 'active' && token);
+}
+
+/**
+ * Kiểm tra quyền Giáo viên ĐÃ ĐƯỢC QUẢN TRỊ VIÊN DUYỆT từ phiên xác thực đáng tin cậy
+ */
+export function isVerifiedTeacherSession(): boolean {
+  const user = getSavedSessionUser();
+  const token = getActiveSessionToken();
+  if (!user || !token || user.status !== 'active') return false;
+  if (user.role === 'admin') return true;
+  return Boolean(
+    user.role === 'teacher' &&
+      (!user.teacherApprovalStatus || user.teacherApprovalStatus === 'approved')
+  );
+}
+
+function getAuthHeaders(): Record<string, string> {
+  const token = getActiveSessionToken();
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  return headers;
+}
+
+/**
+ * Kiểm tra trạng thái khởi tạo hệ thống (Quản trị viên & cấu hình dịch vụ gửi email OTP)
+ */
+export interface ServerFirebaseAdminStatus {
+  projectId: string;
+  firestoreDatabaseId: string;
+  firstAdminUidConfigured: boolean;
+  firstAdminUidMasked: string | null;
+  serviceAccountConfigured: boolean;
+  credentialSource: string;
+  adminSdkInitialized: boolean;
+  initializationError: string | null;
+  missingEnvVars: string[];
+}
+
+export async function checkTeacherBootstrapStatus(): Promise<{
+  needsAdminBootstrap: boolean;
+  needsTeacherBootstrap: boolean;
+  emailProviderStatus?: {
+    configured: boolean;
+    providerName: string;
+    missingEnvVars: string[];
+  };
+  firebaseAdminStatus?: ServerFirebaseAdminStatus;
+  totalAccounts: number;
+}> {
+  try {
+    const res = await fetch('/api/auth/bootstrap-status');
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('Không kiểm tra được trạng thái khởi tạo:', err);
+  }
+  return {
+    needsAdminBootstrap: false,
+    needsTeacherBootstrap: false,
+    totalAccounts: 0
+  };
+}
+
+/**
+ * Kích hoạt quy trình cấp custom claim admin=true phía máy chủ bằng Firebase Admin SDK
+ * (Chỉ hoạt động khi người gọi đang đăng nhập Firebase Auth với UID trùng khớp FIRST_ADMIN_UID
+ * và máy chủ đã cấu hình FIREBASE_SERVICE_ACCOUNT_JSON / GOOGLE_APPLICATION_CREDENTIALS).
+ */
+export async function triggerServerAdminClaimBootstrap(
+  firebaseIdToken: string
+): Promise<{
+  success: boolean;
+  customClaimGranted?: boolean;
+  firestoreAdminDocSynced?: boolean;
+  message: string;
+}> {
+  try {
+    const res = await fetch('/api/auth/bootstrap-admin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ firebaseIdToken })
+    });
+    const data = await res.json();
+    return {
+      success: Boolean(res.ok && data.success),
+      customClaimGranted: data.customClaimGranted,
+      firestoreAdminDocSynced: data.firestoreAdminDocSynced,
+      message: data.message || 'Không thể chạy quy trình khởi tạo Quản trị viên trên máy chủ.'
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      message: 'Lỗi kết nối máy chủ: ' + (err.message || '')
+    };
+  }
+}
+
+// ============================================================================
+// TEACHER REGISTRATION & OWNERSHIP VERIFICATION (PHONE OTP / GMAIL OTP)
+// ============================================================================
+export async function submitTeacherRegistration(payload: {
+  username?: string;
+  fullName: string;
+  phone: string;
+  gmail: string;
+  password: string;
+  verificationMethod: TeacherVerificationMethod;
+}): Promise<{
+  success: boolean;
+  registration?: TeacherRegistrationRecord;
+  emailProviderStatus?: {
+    configured: boolean;
+    providerName: string;
+    missingEnvVars: string[];
+  };
+  message: string;
+}> {
+  const res = await fetch('/api/teacher-registration/submit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json();
+  return {
+    success: Boolean(res.ok && data.success),
+    registration: data.registration,
+    emailProviderStatus: data.emailProviderStatus,
+    message: data.message || (res.ok ? 'Gửi yêu cầu thành công.' : 'Lỗi gửi yêu cầu đăng ký.')
+  };
+}
+
+export async function sendTeacherGmailOtp(registrationId: string): Promise<{
+  success: boolean;
+  providerConfigured?: boolean;
+  missingEnvVars?: string[];
+  expiresAt?: string;
+  message: string;
+}> {
+  const res = await fetch('/api/teacher-registration/send-gmail-otp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ registrationId })
+  });
+  const data = await res.json();
+  return {
+    success: Boolean(res.ok && data.success),
+    providerConfigured: data.providerConfigured,
+    missingEnvVars: data.missingEnvVars,
+    expiresAt: data.expiresAt,
+    message: data.message || 'Không thể gửi mã xác minh Gmail.'
+  };
+}
+
+export async function verifyTeacherGmailOtp(
+  registrationId: string,
+  otpCode: string
+): Promise<{
+  success: boolean;
+  registration?: TeacherRegistrationRecord;
+  message: string;
+}> {
+  const res = await fetch('/api/teacher-registration/verify-gmail-otp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ registrationId, otpCode })
+  });
+  const data = await res.json();
+  return {
+    success: Boolean(res.ok && data.success),
+    registration: data.registration,
+    message: data.message || 'Xác minh mã Gmail không thành công.'
+  };
+}
+
+export async function verifyTeacherPhoneOtp(
+  registrationId: string,
+  firebaseIdToken: string
+): Promise<{
+  success: boolean;
+  registration?: TeacherRegistrationRecord;
+  message: string;
+}> {
+  const res = await fetch('/api/teacher-registration/verify-phone-otp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ registrationId, firebaseIdToken })
+  });
+  const data = await res.json();
+  return {
+    success: Boolean(res.ok && data.success),
+    registration: data.registration,
+    message: data.message || 'Xác minh OTP Số điện thoại không thành công.'
+  };
+}
+
+export async function fetchTeacherRegistrationStatus(identifier: string): Promise<{
+  found: boolean;
+  registration?: TeacherRegistrationRecord;
+  message?: string;
+}> {
+  const res = await fetch(
+    `/api/teacher-registration/status/${encodeURIComponent(identifier.trim())}`
+  );
+  const data = await res.json();
+  return {
+    found: Boolean(res.ok && data.found),
+    registration: data.registration,
+    message: data.message
+  };
+}
+
+// ============================================================================
+// ADMIN OVERVIEW & TEACHER APPROVAL / REJECTION / SUSPENSION
+// ============================================================================
+export async function fetchAdminOverview(): Promise<AdminOverviewData | null> {
+  if (!isVerifiedAdminSession()) return null;
+  const res = await fetch('/api/admin/overview', {
+    headers: getAuthHeaders()
+  });
+  if (!res.ok) return null;
+  return await res.json();
+}
+
+export async function reviewTeacherRegistrationByAdmin(payload: {
+  teacherUid?: string;
+  registrationId?: string;
+  action: 'approve' | 'reject' | 'suspend' | 'reactivate';
+  reason?: string;
+}): Promise<{
+  success: boolean;
+  registration?: TeacherRegistrationRecord;
+  message: string;
+}> {
+  if (!isVerifiedAdminSession()) {
+    throw new Error('Từ chối truy cập: Chỉ Quản trị viên mới có quyền duyệt giáo viên.');
+  }
+  const res = await fetch('/api/admin/teacher-review', {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json();
+  return {
+    success: Boolean(res.ok && data.success),
+    registration: data.registration,
+    message: data.message || (res.ok ? 'Đã cập nhật trạng thái giáo viên.' : 'Lỗi xét duyệt.')
+  };
+}
+
+// ============================================================================
+// TEACHER CLASSROOM & QUOTA SERVICE (MAX 5 ACTIVE CLASSES, MAX 50 STUDENTS/CLASS)
+// ============================================================================
+export async function fetchTeacherClasses(): Promise<{
+  classes: ClassroomRecord[];
+  quota: {
+    activeClassesCount: number;
+    maxActiveClasses: number;
+    remainingClassesQuota: number;
+    maxStudentsPerClass: number;
+  };
+}> {
+  if (!isVerifiedTeacherSession()) {
+    return {
+      classes: [],
+      quota: {
+        activeClassesCount: 0,
+        maxActiveClasses: 5,
+        remainingClassesQuota: 5,
+        maxStudentsPerClass: 50
+      }
+    };
+  }
+  try {
+    const res = await fetch('/api/classes', {
+      headers: getAuthHeaders()
+    });
+    if (res.ok) {
+      const data = await res.json();
+      cachedClasses = data.classes || [];
+      return {
+        classes: cachedClasses,
+        quota: data.quota || {
+          activeClassesCount: cachedClasses.length,
+          maxActiveClasses: 5,
+          remainingClassesQuota: Math.max(0, 5 - cachedClasses.length),
+          maxStudentsPerClass: 50
+        }
+      };
+    }
+  } catch (err) {
+    console.warn('Lỗi tải danh sách lớp:', err);
+  }
+  return {
+    classes: cachedClasses,
+    quota: {
+      activeClassesCount: cachedClasses.length,
+      maxActiveClasses: 5,
+      remainingClassesQuota: Math.max(0, 5 - cachedClasses.length),
+      maxStudentsPerClass: 50
+    }
+  };
+}
+
+export async function createTeacherClassroom(name: string): Promise<{
+  success: boolean;
+  classroom?: ClassroomRecord;
+  quota?: {
+    activeClassesCount: number;
+    maxActiveClasses: number;
+    remainingClassesQuota: number;
+  };
+  message: string;
+}> {
+  if (!isVerifiedTeacherSession()) {
+    throw new Error('Từ chối truy cập: Chỉ Giáo viên đã được Quản trị viên duyệt mới được tạo lớp học.');
+  }
+  const res = await fetch('/api/classes', {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ name })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    return {
+      success: false,
+      quota: data.quota,
+      message: data.error || 'Không thể tạo lớp mới.'
+    };
+  }
+  return {
+    success: true,
+    classroom: data.classroom,
+    quota: data.quota,
+    message: data.message || `Đã tạo lớp ${name} thành công!`
+  };
+}
+
+/**
+ * Tải danh sách tài khoản từ Backend thật (/api/accounts) — Yêu cầu quyền Giáo viên đã duyệt
+ */
+export async function initializeAccounts(): Promise<UserAccount[]> {
+  try {
+    const token = getActiveSessionToken();
+    if (!token) {
+      cachedAccounts = [];
+      return [];
+    }
+    const res = await fetch('/api/accounts', {
+      headers: getAuthHeaders()
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.accounts)) {
+        cachedAccounts = data.accounts;
+        return cachedAccounts;
+      }
+    }
+  } catch (err) {
+    console.warn('Không thể tải danh sách tài khoản từ máy chủ:', err);
+  }
+  return cachedAccounts;
+}
+
+export function getStoredAccountsSync(): UserAccount[] {
+  return cachedAccounts;
+}
+
+/**
+ * Xác thực đăng nhập bằng Mã tài khoản + Mật khẩu qua Backend bảo mật (/api/auth/login)
+ */
+export async function authenticateWithCredentials(
+  username: string,
+  plainPassword: string
+): Promise<{
+  success: boolean;
+  user?: UserAccount;
+  code?: string;
+  registrationId?: string;
+  message?: string;
+}> {
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password: plainPassword })
+    });
+    const data = await res.json();
+    if (res.ok && data.success && data.user && data.sessionToken) {
+      saveAuthSession(data.user, data.sessionToken, data.adminApprovalSignature);
+      if (data.user.role === 'teacher' || data.user.role === 'admin') {
+        await initializeAccounts();
+      }
+      return { success: true, user: data.user };
+    }
+    return {
+      success: false,
+      code: data.code,
+      registrationId: data.registrationId,
+      message: data.message || 'Đăng nhập không thành công. Vui lòng kiểm tra lại thông tin.'
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      message: 'Lỗi kết nối máy chủ xác thực: ' + (err.message || 'Vui lòng thử lại.')
+    };
+  }
+}
+
+/**
+ * Kích hoạt tài khoản học sinh lần đầu bằng mã 6 chữ số qua Backend (/api/auth/activate)
+ */
+export async function activateStudentAccount(
+  username: string,
+  activationCode: string,
+  newPassword: string
+): Promise<{ success: boolean; user?: UserAccount; message?: string }> {
+  try {
+    const res = await fetch('/api/auth/activate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, activationCode, newPassword })
+    });
+    const data = await res.json();
+    if (res.ok && data.success && data.user && data.sessionToken) {
+      saveAuthSession(data.user, data.sessionToken);
+      return {
+        success: true,
+        user: data.user,
+        message: data.message || 'Kích hoạt tài khoản thành công!'
+      };
+    }
+    return {
+      success: false,
+      message: data.message || 'Kích hoạt không thành công.'
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      message: 'Lỗi kết nối máy chủ khi kích hoạt: ' + (err.message || '')
+    };
+  }
+}
+
+/**
+ * Xác thực phiên Firebase Authentication với máy chủ bằng Firebase ID Token đã ký (/api/auth/google-match).
+ * Máy chủ tự giải mã & kiểm tra chữ ký ID Token, UID và custom claim `admin === true`.
+ */
+export async function matchAccountByGoogleEmail(
+  firebaseIdToken: string,
+  displayName?: string
+): Promise<{
+  matched: boolean;
+  user?: UserAccount;
+  firebaseUid?: string;
+  code?: string;
+  adminApprovalSignature?: string;
+  message?: string;
+}> {
+  try {
+    const res = await fetch('/api/auth/google-match', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ firebaseIdToken, displayName })
+    });
+    const data = await res.json();
+    if (res.ok && data.matched && data.user && data.sessionToken) {
+      saveAuthSession(data.user, data.sessionToken, data.adminApprovalSignature);
+      if (data.user.role === 'teacher' || data.user.role === 'admin') {
+        await initializeAccounts();
+      }
+      return {
+        matched: true,
+        user: data.user,
+        firebaseUid: data.firebaseUid,
+        adminApprovalSignature: data.adminApprovalSignature
+      };
+    }
+    return {
+      matched: false,
+      firebaseUid: data.firebaseUid,
+      code: data.code,
+      message:
+        data.message ||
+        'Tài khoản Firebase hiện tại chưa được cấp quyền truy cập trong hệ thống.'
+    };
+  } catch (err: any) {
+    return {
+      matched: false,
+      message: 'Lỗi xác thực Firebase ID Token với máy chủ: ' + (err.message || '')
+    };
+  }
+}
+
+/**
+ * Đổi mật khẩu qua Backend (/api/auth/change-password)
+ */
+export async function changeUserPassword(
+  userId: string,
+  oldPass: string,
+  newPass: string
+): Promise<{ success: boolean; message: string }> {
+  try {
+    const res = await fetch('/api/auth/change-password', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ userId, oldPass, newPass })
+    });
+    const data = await res.json();
+    return {
+      success: Boolean(res.ok && data.success),
+      message: data.message || (res.ok ? 'Đổi mật khẩu thành công!' : 'Không thể đổi mật khẩu.')
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      message: 'Lỗi kết nối máy chủ: ' + (err.message || '')
+    };
+  }
+}
+
+/**
+ * Giáo viên cấp lại mã kích hoạt 6 số cho học sinh (/api/accounts/reset-code)
+ */
+export async function resetActivationCodeForStudent(
+  studentId: string
+): Promise<{ success: boolean; newCode: string; expiresAt: string }> {
+  if (!isVerifiedTeacherSession()) {
+    throw new Error('Từ chối truy cập: Chỉ Giáo viên đã đăng nhập mới có quyền cấp lại mã kích hoạt.');
+  }
+  const res = await fetch('/api/accounts/reset-code', {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ studentId })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Không thể cấp lại mã kích hoạt.');
+  }
+  await initializeAccounts();
+  return {
+    success: true,
+    newCode: data.newCode,
+    expiresAt: data.expiresAt
+  };
+}
+
+/**
+ * Giáo viên khóa / mở khóa tài khoản học sinh (/api/accounts/toggle-lock)
+ */
+export async function toggleAccountLock(studentId: string): Promise<UserAccount | null> {
+  if (!isVerifiedTeacherSession()) {
+    throw new Error('Từ chối truy cập: Chỉ Giáo viên đã đăng nhập mới có quyền khóa/mở tài khoản.');
+  }
+  const res = await fetch('/api/accounts/toggle-lock', {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ studentId })
+  });
+  const data = await res.json();
+  if (!res.ok) return null;
+  await initializeAccounts();
+  return data.account || null;
+}
+
+/**
+ * Giáo viên thêm học sinh mới vào danh sách lớp (/api/accounts/student)
+ */
+export async function addNewStudent(payload: {
+  username: string;
+  fullName: string;
+  className: string;
+  email?: string;
+  notes?: string;
+}): Promise<UserAccount> {
+  if (!isVerifiedTeacherSession()) {
+    throw new Error('Từ chối truy cập: Chỉ Giáo viên đã đăng nhập mới có quyền thêm học sinh.');
+  }
+  const res = await fetch('/api/accounts/student', {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Không thể thêm học sinh.');
+  }
+  await initializeAccounts();
+  return data.account;
+}
+
+/**
+ * Giáo viên nhập danh sách học sinh hàng loạt (/api/accounts/batch)
+ */
+export async function importBatchStudents(
+  rows: { username: string; fullName: string; className: string; email?: string; notes?: string }[]
+): Promise<{ addedCount: number; skippedCount: number; newAccounts: UserAccount[] }> {
+  if (!isVerifiedTeacherSession()) {
+    throw new Error('Từ chối truy cập: Chỉ Giáo viên đã đăng nhập mới có quyền nhập danh sách lớp.');
+  }
+  const res = await fetch('/api/accounts/batch', {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ rows })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Không thể nhập danh sách học sinh.');
+  }
+  await initializeAccounts();
+  return {
+    addedCount: data.addedCount || 0,
+    skippedCount: data.skippedCount || 0,
+    newAccounts: data.newAccounts || []
+  };
+}
+
+/**
+ * Đọc / Ghi hồ sơ học tập gắn theo UID ổn định trên máy chủ (/api/student-state/:uid)
+ */
+export async function fetchStudentStateFromServer(uid: string): Promise<{
+  survey?: StudentSurveyData;
+  readingAttempts?: ReadingAttempt[];
+  writingRecords?: WritingSubmissionRecord[];
+} | null> {
+  const token = getActiveSessionToken();
+  if (!token || !uid) return null;
+  try {
+    const res = await fetch(`/api/student-state/${encodeURIComponent(uid)}`, {
+      headers: getAuthHeaders()
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.state || null;
+    }
+  } catch (err) {
+    console.warn('Không đọc được hồ sơ từ máy chủ:', err);
+  }
+  return null;
+}
+
+export async function saveStudentStateToServer(
+  uid: string,
+  state: {
+    survey: StudentSurveyData;
+    readingAttempts: ReadingAttempt[];
+    writingRecords: WritingSubmissionRecord[];
+  }
+): Promise<boolean> {
+  const token = getActiveSessionToken();
+  if (!token || !uid) return false;
+  try {
+    const res = await fetch(`/api/student-state/${encodeURIComponent(uid)}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(state)
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchAllStudentStatesForTeacher(): Promise<
+  Record<
+    string,
+    {
+      uid: string;
+      survey: StudentSurveyData | null;
+      readingAttempts: ReadingAttempt[];
+      writingRecords: WritingSubmissionRecord[];
+      updatedAt: string;
+    }
+  >
+> {
+  if (!isVerifiedTeacherSession()) return {};
+  try {
+    const res = await fetch('/api/teacher/student-states', {
+      headers: getAuthHeaders()
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.states || {};
+    }
+  } catch (err) {
+    console.warn('Không tải được dữ liệu học tập toàn lớp:', err);
+  }
+  return {};
+}
+
+export function saveSessionUser(user: UserAccount | null): void {
+  if (!user) {
+    saveAuthSession(null, null, null);
+  }
+}
+
+export function getSavedCurrentUserId(): string | null {
+  const user = getSavedSessionUser();
+  return user?.id || null;
+}
+
+export function saveCurrentUserId(userId: string | null): void {
+  if (!userId) {
+    saveAuthSession(null, null, null);
+  }
+}

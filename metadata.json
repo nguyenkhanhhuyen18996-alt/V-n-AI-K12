@@ -1,0 +1,6 @@
+{
+  "name": "VănAI 12 – Trợ lý đọc hiểu và viết",
+  "description": "Ứng dụng trợ lý sư phạm rèn luyện năng lực đọc hiểu văn bản và viết bài nghị luận dành cho học sinh lớp 12 ôn thi tốt nghiệp THPT.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

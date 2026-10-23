@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Be Vietnam Pro', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background-color: #FAF7F2;
+    color: #1E293B;
+  }
+}
+
+.font-serif-literary {
+  font-family: 'Lora', Georgia, serif;
+}
+

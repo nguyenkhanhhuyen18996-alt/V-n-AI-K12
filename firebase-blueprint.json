@@ -1,0 +1,482 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Pedagogical profile of an authenticated student or teacher in VanAI 12.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "description": "School internal account code (e.g. 12A1-19 or GV-VAN01).",
+          "minLength": 2,
+          "maxLength": 64
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Full name of the student or teacher.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "description": "Role of the user in the school system.",
+          "enum": ["student", "teacher", "admin"]
+        },
+        "className": {
+          "type": "string",
+          "description": "Class name or list of classes.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "status": {
+          "type": "string",
+          "description": "Account status.",
+          "enum": ["active", "pending_activation", "locked"]
+        },
+        "surveyCompleted": {
+          "type": "boolean",
+          "description": "Whether student completed the quick survey."
+        },
+        "targetScore": {
+          "type": "number",
+          "description": "Target exam score out of 10."
+        },
+        "quickFocusArea": {
+          "type": "string",
+          "description": "Focus area from quick survey.",
+          "maxLength": 64
+        },
+        "quickDailyTime": {
+          "type": "string",
+          "description": "Daily practice time preference.",
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp."
+        }
+      },
+      "required": ["uid", "username", "fullName", "role", "className", "status", "surveyCompleted", "targetScore", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII and private account metadata for a user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified email address of the user.",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp."
+        }
+      },
+      "required": ["uid", "email", "updatedAt"]
+    },
+    "StudentRosterItem": {
+      "title": "StudentRosterItem",
+      "description": "Teacher-managed student roster record and activation status.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Roster document ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "description": "Student code (e.g. 12A1-08).",
+          "minLength": 2,
+          "maxLength": 64
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Student full name.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "description": "Account role.",
+          "enum": ["student", "teacher"]
+        },
+        "className": {
+          "type": "string",
+          "description": "Assigned class name.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "status": {
+          "type": "string",
+          "description": "Account activation status.",
+          "enum": ["active", "pending_activation", "locked"]
+        },
+        "isActivated": {
+          "type": "boolean",
+          "description": "Whether the student has activated their account."
+        },
+        "linkedUid": {
+          "type": "string",
+          "description": "Linked Firebase Auth UID once signed in.",
+          "maxLength": 128
+        },
+        "notes": {
+          "type": "string",
+          "description": "Pedagogical notes from teacher.",
+          "maxLength": 1000
+        },
+        "createdByUid": {
+          "type": "string",
+          "description": "Teacher UID who created the record.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Update timestamp."
+        }
+      },
+      "required": ["id", "username", "fullName", "role", "className", "status", "isActivated", "createdByUid", "createdAt", "updatedAt"]
+    },
+    "ExamDocument": {
+      "title": "ExamDocument",
+      "description": "Complete Literature 12 exam structured and verified by a teacher.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Exam ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "code": {
+          "type": "string",
+          "description": "Exam code.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "description": "Exam title.",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "templateType": {
+          "type": "string",
+          "description": "Exam structure template.",
+          "enum": ["template_a", "template_b", "custom"]
+        },
+        "status": {
+          "type": "string",
+          "description": "Workflow state of the exam.",
+          "enum": ["draft", "verified", "assigned"]
+        },
+        "authorUid": {
+          "type": "string",
+          "description": "Teacher UID who created/uploaded the exam.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "readingPassageContent": {
+          "type": "string",
+          "description": "Reading comprehension passage content.",
+          "minLength": 1,
+          "maxLength": 30000
+        },
+        "paragraphPrompt": {
+          "type": "string",
+          "description": "200-word paragraph prompt.",
+          "minLength": 1,
+          "maxLength": 5000
+        },
+        "essayPrompt": {
+          "type": "string",
+          "description": "600-word essay prompt.",
+          "minLength": 1,
+          "maxLength": 5000
+        },
+        "totalScore": {
+          "type": "number",
+          "description": "Total exam score (standard 10.0)."
+        },
+        "durationMinutes": {
+          "type": "number",
+          "description": "Duration in minutes."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Update timestamp."
+        }
+      },
+      "required": ["id", "code", "title", "templateType", "status", "authorUid", "readingPassageContent", "paragraphPrompt", "essayPrompt", "totalScore", "durationMinutes", "createdAt", "updatedAt"]
+    },
+    "ExamSubmissionDocument": {
+      "title": "ExamSubmissionDocument",
+      "description": "Student submission and AI/teacher evaluation for a complete exam.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Submission ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "examId": {
+          "type": "string",
+          "description": "Referenced exam ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the submitting student.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentCode": {
+          "type": "string",
+          "description": "Student internal code.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "studentName": {
+          "type": "string",
+          "description": "Student full name.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "className": {
+          "type": "string",
+          "description": "Student class.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "status": {
+          "type": "string",
+          "description": "Evaluation state.",
+          "enum": ["submitted", "ai_evaluated", "teacher_approved"]
+        },
+        "paragraphText": {
+          "type": "string",
+          "description": "Student 200-word paragraph answer.",
+          "maxLength": 15000
+        },
+        "essayText": {
+          "type": "string",
+          "description": "Student 600-word essay answer.",
+          "maxLength": 35000
+        },
+        "proposedTotal": {
+          "type": "number",
+          "description": "AI proposed total score."
+        },
+        "confirmedTotal": {
+          "type": "number",
+          "description": "Teacher confirmed total score."
+        },
+        "teacherNotes": {
+          "type": "string",
+          "description": "Teacher review notes.",
+          "maxLength": 5000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Submission timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp."
+        }
+      },
+      "required": ["id", "examId", "studentUid", "studentCode", "studentName", "className", "status", "paragraphText", "essayText", "proposedTotal", "createdAt", "updatedAt"]
+    },
+    "PracticeRecordDocument": {
+      "title": "PracticeRecordDocument",
+      "description": "Student reading comprehension or writing practice record.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Practice record ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the student.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "recordType": {
+          "type": "string",
+          "description": "Type of practice.",
+          "enum": ["reading", "writing"]
+        },
+        "title": {
+          "type": "string",
+          "description": "Passage or prompt title.",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "content": {
+          "type": "string",
+          "description": "Student answer or essay content.",
+          "minLength": 1,
+          "maxLength": 35000
+        },
+        "aiSuggestedScore": {
+          "type": "number",
+          "description": "AI suggested score."
+        },
+        "teacherConfirmedScore": {
+          "type": "number",
+          "description": "Teacher confirmed score."
+        },
+        "scoreStatus": {
+          "type": "string",
+          "description": "Whether score is AI suggested or teacher approved.",
+          "enum": ["ai_suggested", "teacher_approved"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Update timestamp."
+        }
+      },
+      "required": ["id", "studentUid", "recordType", "title", "content", "aiSuggestedScore", "scoreStatus", "createdAt", "updatedAt"]
+    },
+    "ClassroomDocument": {
+      "title": "ClassroomDocument",
+      "description": "Teacher classroom with enforced quota (max 5 active classes per teacher, max 50 students per class).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "teacherUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "teacherName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "status": { "type": "string", "enum": ["active", "archived"] },
+        "enrolledCount": { "type": "integer", "minimum": 0, "maximum": 50 },
+        "maxCapacity": { "type": "integer", "minimum": 50, "maximum": 50 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "teacherUid", "teacherName", "status", "enrolledCount", "maxCapacity", "createdAt", "updatedAt"]
+    },
+    "TeacherRegistrationDocument": {
+      "title": "TeacherRegistrationDocument",
+      "description": "Teacher onboarding request with phone/Gmail ownership verification and admin approval status.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "teacherUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "username": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "phone": { "type": "string", "minLength": 8, "maxLength": 32 },
+        "gmail": { "type": "string", "minLength": 5, "maxLength": 254 },
+        "verificationMethod": { "type": "string", "enum": ["phone_otp", "gmail_otp"] },
+        "phoneVerified": { "type": "boolean" },
+        "gmailVerified": { "type": "boolean" },
+        "isOwnershipVerified": { "type": "boolean" },
+        "approvalStatus": {
+          "type": "string",
+          "enum": ["pending_verification", "pending_admin_approval", "approved", "rejected", "suspended"]
+        },
+        "rejectionReason": { "type": "string", "maxLength": 500 },
+        "reviewedByUid": { "type": "string", "maxLength": 128 },
+        "reviewedByName": { "type": "string", "maxLength": 120 },
+        "reviewedAt": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "teacherUid", "username", "fullName", "phone", "gmail", "verificationMethod", "phoneVerified", "gmailVerified", "isOwnershipVerified", "approvalStatus", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Pedagogical user profiles for students and teachers."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Isolated PII (email) accessible only by the owner or admin."
+    },
+    "/student_rosters/{rosterId}": {
+      "schema": { "$ref": "#/entities/StudentRosterItem" },
+      "description": "Teacher-managed student roster and account activation states."
+    },
+    "/exams/{examId}": {
+      "schema": { "$ref": "#/entities/ExamDocument" },
+      "description": "Complete exams uploaded, verified, and assigned by teachers."
+    },
+    "/exam_submissions/{submissionId}": {
+      "schema": { "$ref": "#/entities/ExamSubmissionDocument" },
+      "description": "Student exam submissions and AI/teacher grading records."
+    },
+    "/practice_records/{recordId}": {
+      "schema": { "$ref": "#/entities/PracticeRecordDocument" },
+      "description": "Student reading and writing practice records."
+    },
+    "/classes/{classId}": {
+      "schema": { "$ref": "#/entities/ClassroomDocument" },
+      "description": "Teacher classrooms with server-enforced quota (max 5 active per teacher, max 50 students per class)."
+    },
+    "/teacher_registrations/{registrationId}": {
+      "schema": { "$ref": "#/entities/TeacherRegistrationDocument" },
+      "description": "Teacher onboarding requests verified by Phone OTP or Gmail OTP and reviewed by Admin."
+    }
+  }
+}

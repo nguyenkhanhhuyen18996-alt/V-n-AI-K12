@@ -1,0 +1,571 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // PRIMITIVE HELPERS (Zero hardcoded PII or default credentials)
+    // =========================================================================
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    // Teacher / Admin check via dedicated /admins/{uid} registry (used in single-doc operations)
+    function isAdmin() {
+      return isVerifiedUser() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role in ['teacher', 'admin'];
+    }
+
+    function isSuperAdmin() {
+      return isVerifiedUser() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // =========================================================================
+    // VALIDATION BLUEPRINTS (Anti-Update-Gap)
+    // =========================================================================
+    function isValidAdminDocument(data) {
+      return data.keys().hasAll(['uid', 'role', 'approvalSignature', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'role', 'approvalSignature', 'createdAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.role is string && data.role in ['teacher', 'admin'] &&
+        data.approvalSignature is string && data.approvalSignature.size() >= 16 && data.approvalSignature.size() <= 256 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+          'uid', 'username', 'fullName', 'role', 'className',
+          'status', 'surveyCompleted', 'targetScore', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid', 'username', 'fullName', 'role', 'className',
+          'status', 'surveyCompleted', 'targetScore',
+          'quickFocusArea', 'quickDailyTime', 'createdAt', 'updatedAt'
+        ]) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.username is string && data.username.size() >= 2 && data.username.size() <= 64 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        data.role is string && data.role in ['student', 'teacher', 'admin'] &&
+        data.className is string && data.className.size() >= 1 && data.className.size() <= 100 &&
+        data.status is string && data.status in ['active', 'pending_activation', 'locked'] &&
+        data.surveyCompleted is bool &&
+        data.targetScore is number && data.targetScore >= 0 && data.targetScore <= 10 &&
+        (!('quickFocusArea' in data) || (data.quickFocusArea is string && data.quickFocusArea.size() <= 64)) &&
+        (!('quickDailyTime' in data) || (data.quickDailyTime is string && data.quickDailyTime.size() <= 64)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidClassroomDocument(data) {
+      return data.keys().hasAll([
+          'id', 'name', 'teacherUid', 'teacherName', 'status',
+          'enrolledCount', 'maxCapacity', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'name', 'teacherUid', 'teacherName', 'status',
+          'enrolledCount', 'maxCapacity', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 64 &&
+        data.teacherUid is string && data.teacherUid.size() >= 1 && data.teacherUid.size() <= 128 && data.teacherUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.teacherName is string && data.teacherName.size() >= 1 && data.teacherName.size() <= 120 &&
+        data.status is string && data.status in ['active', 'archived'] &&
+        data.enrolledCount is int && data.enrolledCount >= 0 && data.enrolledCount <= 50 &&
+        data.maxCapacity is int && data.maxCapacity == 50 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTeacherRegistrationDocument(data) {
+      return data.keys().hasAll([
+          'id', 'teacherUid', 'username', 'fullName', 'phone', 'gmail',
+          'verificationMethod', 'phoneVerified', 'gmailVerified',
+          'isOwnershipVerified', 'approvalStatus', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'teacherUid', 'username', 'fullName', 'phone', 'gmail',
+          'verificationMethod', 'phoneVerified', 'gmailVerified',
+          'isOwnershipVerified', 'approvalStatus', 'rejectionReason',
+          'reviewedByUid', 'reviewedByName', 'reviewedAt',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.teacherUid is string && data.teacherUid.size() >= 1 && data.teacherUid.size() <= 128 && data.teacherUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.username is string && data.username.size() >= 2 && data.username.size() <= 64 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        data.phone is string && data.phone.size() >= 8 && data.phone.size() <= 32 &&
+        data.gmail is string && data.gmail.size() >= 5 && data.gmail.size() <= 254 &&
+        data.verificationMethod is string && data.verificationMethod in ['phone_otp', 'gmail_otp'] &&
+        data.phoneVerified is bool &&
+        data.gmailVerified is bool &&
+        data.isOwnershipVerified is bool &&
+        data.approvalStatus is string && data.approvalStatus in [
+          'pending_verification', 'pending_admin_approval', 'approved', 'rejected', 'suspended'
+        ] &&
+        (!('rejectionReason' in data) || (data.rejectionReason is string && data.rejectionReason.size() <= 500)) &&
+        (!('reviewedByUid' in data) || (data.reviewedByUid is string && data.reviewedByUid.size() <= 128)) &&
+        (!('reviewedByName' in data) || (data.reviewedByName is string && data.reviewedByName.size() <= 120)) &&
+        (!('reviewedAt' in data) || (data.reviewedAt is string && data.reviewedAt.size() <= 64)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data) {
+      return data.keys().hasAll(['uid', 'email', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'updatedAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidStudentRosterItem(data) {
+      return data.keys().hasAll([
+          'id', 'username', 'fullName', 'role', 'className',
+          'status', 'isActivated', 'createdByUid', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'username', 'fullName', 'role', 'className',
+          'status', 'isActivated', 'linkedUid', 'notes',
+          'createdByUid', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.username is string && data.username.size() >= 2 && data.username.size() <= 64 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        data.role is string && data.role in ['student', 'teacher'] &&
+        data.className is string && data.className.size() >= 1 && data.className.size() <= 64 &&
+        data.status is string && data.status in ['active', 'pending_activation', 'locked'] &&
+        data.isActivated is bool &&
+        (!('linkedUid' in data) || (data.linkedUid is string && data.linkedUid.size() <= 128)) &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000)) &&
+        data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128 && data.createdByUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidExamDocument(data) {
+      return data.keys().hasAll([
+          'id', 'code', 'title', 'templateType', 'status', 'authorUid',
+          'readingPassageContent', 'paragraphPrompt', 'essayPrompt',
+          'totalScore', 'durationMinutes', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'code', 'title', 'templateType', 'status', 'authorUid',
+          'readingPassageContent', 'paragraphPrompt', 'essayPrompt',
+          'totalScore', 'durationMinutes', 'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.code is string && data.code.size() >= 1 && data.code.size() <= 64 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 300 &&
+        data.templateType is string && data.templateType in ['template_a', 'template_b', 'custom'] &&
+        data.status is string && data.status in ['draft', 'verified', 'assigned'] &&
+        data.authorUid is string && data.authorUid.size() >= 1 && data.authorUid.size() <= 128 && data.authorUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.readingPassageContent is string && data.readingPassageContent.size() >= 1 && data.readingPassageContent.size() <= 30000 &&
+        data.paragraphPrompt is string && data.paragraphPrompt.size() >= 1 && data.paragraphPrompt.size() <= 5000 &&
+        data.essayPrompt is string && data.essayPrompt.size() >= 1 && data.essayPrompt.size() <= 5000 &&
+        data.totalScore is number && data.totalScore > 0 && data.totalScore <= 10 &&
+        data.durationMinutes is number && data.durationMinutes >= 5 && data.durationMinutes <= 300 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidExamSubmissionDocument(data) {
+      return data.keys().hasAll([
+          'id', 'examId', 'studentUid', 'studentCode', 'studentName',
+          'className', 'status', 'paragraphText', 'essayText',
+          'proposedTotal', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'examId', 'studentUid', 'studentCode', 'studentName',
+          'className', 'status', 'paragraphText', 'essayText',
+          'proposedTotal', 'confirmedTotal', 'teacherNotes',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.examId is string && data.examId.size() >= 1 && data.examId.size() <= 128 && data.examId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.studentUid is string && data.studentUid.size() >= 1 && data.studentUid.size() <= 128 && data.studentUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.studentCode is string && data.studentCode.size() >= 1 && data.studentCode.size() <= 64 &&
+        data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 120 &&
+        data.className is string && data.className.size() >= 1 && data.className.size() <= 64 &&
+        data.status is string && data.status in ['submitted', 'ai_evaluated', 'teacher_approved'] &&
+        data.paragraphText is string && data.paragraphText.size() <= 15000 &&
+        data.essayText is string && data.essayText.size() <= 35000 &&
+        data.proposedTotal is number && data.proposedTotal >= 0 && data.proposedTotal <= 10 &&
+        (!('confirmedTotal' in data) || (data.confirmedTotal is number && data.confirmedTotal >= 0 && data.confirmedTotal <= 10)) &&
+        (!('teacherNotes' in data) || (data.teacherNotes is string && data.teacherNotes.size() <= 5000)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPracticeRecordDocument(data) {
+      return data.keys().hasAll([
+          'id', 'studentUid', 'recordType', 'title', 'content',
+          'aiSuggestedScore', 'scoreStatus', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'studentUid', 'recordType', 'title', 'content',
+          'aiSuggestedScore', 'teacherConfirmedScore', 'scoreStatus',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.studentUid is string && data.studentUid.size() >= 1 && data.studentUid.size() <= 128 && data.studentUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.recordType is string && data.recordType in ['reading', 'writing'] &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 300 &&
+        data.content is string && data.content.size() >= 1 && data.content.size() <= 35000 &&
+        data.aiSuggestedScore is number && data.aiSuggestedScore >= 0 && data.aiSuggestedScore <= 10 &&
+        (!('teacherConfirmedScore' in data) || (data.teacherConfirmedScore is number && data.teacherConfirmedScore >= 0 && data.teacherConfirmedScore <= 10)) &&
+        data.scoreStatus is string && data.scoreStatus in ['ai_suggested', 'teacher_approved'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // COLLECTION 0: /admins/{adminUid} (Server-Bootstrapped Admin & Approved Teacher Registry)
+    // - Tài khoản Quản trị viên đầu tiên (role == 'admin') CHỈ được khởi tạo từ phía máy chủ
+    //   bằng Firebase Admin SDK (vượt qua client rules). Không người dùng nào có thể tự tạo
+    //   role == 'admin' từ trình duyệt.
+    // - Tài khoản Giáo viên (role == 'teacher') chỉ được ghi bởi Quản trị viên (isSuperAdmin)
+    //   hoặc Firebase Admin SDK phía máy chủ sau khi duyệt.
+    // =========================================================================
+    match /admins/{adminUid} {
+      allow get: if isSignedIn() && isValidId(adminUid) && (request.auth.uid == adminUid || isSuperAdmin());
+      allow list: if isSuperAdmin();
+
+      allow create: if isSuperAdmin() &&
+        isValidId(adminUid) &&
+        isValidAdminDocument(incoming()) &&
+        incoming().uid == adminUid &&
+        incoming().role == 'teacher' &&
+        incoming().createdAt == request.time;
+
+      allow update: if false;
+      allow delete: if isSuperAdmin() && isValidId(adminUid) && existing().role == 'teacher';
+    }
+
+    // =========================================================================
+    // COLLECTION 1: /users/{userId}
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isSignedIn() && resource.data.uid == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == request.auth.uid &&
+        userId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (incoming().role == 'student' && incoming().status == 'active') ||
+          (incoming().role == 'teacher' && isAdmin() && incoming().status == 'active') ||
+          (incoming().role == 'admin' && isSuperAdmin() && incoming().status == 'active')
+        );
+
+      allow update: if isVerifiedUser() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            request.auth.uid == userId &&
+            existing().status == 'active' &&
+            incoming().role == existing().role &&
+            incoming().status == existing().status &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'surveyCompleted', 'targetScore',
+              'quickFocusArea', 'quickDailyTime', 'updatedAt'
+            ])
+          ) ||
+          (isAdmin() && incoming().role == existing().role && incoming().role != 'admin') ||
+          isSuperAdmin()
+        );
+
+      allow delete: if isSuperAdmin() && isValidId(userId);
+
+      // Subcollection: Isolated PII (/users/{userId}/private/{docId})
+      match /private/{docId} {
+        allow get: if isSignedIn() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          (request.auth.uid == userId || isAdmin()) &&
+          exists(/databases/$(database)/documents/users/$(userId));
+
+        allow list: if false;
+
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          isValidUserPrivateInfo(incoming()) &&
+          request.auth.uid == userId &&
+          incoming().uid == userId &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          isValidUserPrivateInfo(incoming()) &&
+          incoming().uid == existing().uid &&
+          incoming().updatedAt == request.time &&
+          (
+            (
+              request.auth.uid == userId &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt'])
+            ) ||
+            isAdmin()
+          ) &&
+          exists(/databases/$(database)/documents/users/$(userId));
+
+        allow delete: if isAdmin() && isValidId(userId) && isValidId(docId);
+      }
+    }
+
+    // =========================================================================
+    // COLLECTION 2: /student_rosters/{rosterId}
+    // =========================================================================
+    match /student_rosters/{rosterId} {
+      allow get: if isSignedIn() && isValidId(rosterId) && (
+        isAdmin() ||
+        ('linkedUid' in resource.data && resource.data.linkedUid == request.auth.uid)
+      );
+
+      allow list: if isSignedIn() && (
+        resource.data.createdByUid == request.auth.uid ||
+        ('linkedUid' in resource.data && resource.data.linkedUid == request.auth.uid)
+      );
+
+      allow create: if isAdmin() &&
+        isValidId(rosterId) &&
+        isValidStudentRosterItem(incoming()) &&
+        incoming().id == rosterId &&
+        incoming().createdByUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(rosterId) &&
+        isValidStudentRosterItem(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().createdByUid == existing().createdByUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+
+      allow delete: if isAdmin() && isValidId(rosterId);
+    }
+
+    // =========================================================================
+    // COLLECTION 3: /exams/{examId}
+    // =========================================================================
+    match /exams/{examId} {
+      allow get: if isSignedIn() && isValidId(examId) && (
+        resource.data.status == 'assigned' || isAdmin()
+      );
+
+      allow list: if isSignedIn() && (
+        resource.data.status == 'assigned' ||
+        resource.data.authorUid == request.auth.uid
+      );
+
+      allow create: if isAdmin() &&
+        isValidId(examId) &&
+        isValidExamDocument(incoming()) &&
+        incoming().id == examId &&
+        incoming().authorUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(examId) &&
+        isValidExamDocument(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().authorUid == existing().authorUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+
+      allow delete: if isAdmin() && isValidId(examId);
+    }
+
+    // =========================================================================
+    // COLLECTION 4: /exam_submissions/{submissionId}
+    // =========================================================================
+    match /exam_submissions/{submissionId} {
+      allow get: if isSignedIn() && isValidId(submissionId) && (
+        resource.data.studentUid == request.auth.uid || isAdmin()
+      );
+
+      allow list: if isSignedIn() && resource.data.studentUid == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(submissionId) &&
+        isValidExamSubmissionDocument(incoming()) &&
+        incoming().id == submissionId &&
+        incoming().studentUid == request.auth.uid &&
+        incoming().status in ['submitted', 'ai_evaluated'] &&
+        !('confirmedTotal' in incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/exams/$(incoming().examId));
+
+      allow update: if isVerifiedUser() &&
+        isValidId(submissionId) &&
+        isValidExamSubmissionDocument(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().examId == existing().examId &&
+        incoming().studentUid == existing().studentUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            request.auth.uid == existing().studentUid &&
+            existing().status != 'teacher_approved' &&
+            incoming().status in ['submitted', 'ai_evaluated'] &&
+            !('confirmedTotal' in incoming()) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'paragraphText', 'essayText', 'proposedTotal', 'status', 'updatedAt'
+            ])
+          ) ||
+          isAdmin()
+        );
+
+      allow delete: if isAdmin() && isValidId(submissionId);
+    }
+
+    // =========================================================================
+    // COLLECTION 5: /practice_records/{recordId}
+    // =========================================================================
+    match /practice_records/{recordId} {
+      allow get: if isSignedIn() && isValidId(recordId) && (
+        resource.data.studentUid == request.auth.uid || isAdmin()
+      );
+
+      allow list: if isSignedIn() && resource.data.studentUid == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(recordId) &&
+        isValidPracticeRecordDocument(incoming()) &&
+        incoming().id == recordId &&
+        incoming().studentUid == request.auth.uid &&
+        incoming().scoreStatus == 'ai_suggested' &&
+        !('teacherConfirmedScore' in incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(recordId) &&
+        isValidPracticeRecordDocument(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().studentUid == existing().studentUid &&
+        incoming().recordType == existing().recordType &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            request.auth.uid == existing().studentUid &&
+            existing().scoreStatus != 'teacher_approved' &&
+            incoming().scoreStatus == 'ai_suggested' &&
+            !('teacherConfirmedScore' in incoming()) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'content', 'aiSuggestedScore', 'updatedAt'
+            ])
+          ) ||
+          isAdmin()
+        );
+
+      allow delete: if isAdmin() && isValidId(recordId);
+    }
+
+    // =========================================================================
+    // COLLECTION 6: /classes/{classId} (Teacher Classrooms - Max 50 students)
+    // =========================================================================
+    match /classes/{classId} {
+      allow get: if isSignedIn() && isValidId(classId) && (
+        resource.data.teacherUid == request.auth.uid || isSuperAdmin()
+      );
+
+      allow list: if isSignedIn() && resource.data.teacherUid == request.auth.uid;
+
+      allow create: if isAdmin() &&
+        isValidId(classId) &&
+        isValidClassroomDocument(incoming()) &&
+        incoming().id == classId &&
+        incoming().teacherUid == request.auth.uid &&
+        incoming().enrolledCount >= 0 &&
+        incoming().enrolledCount <= 50 &&
+        incoming().maxCapacity == 50 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isAdmin() &&
+        isValidId(classId) &&
+        isValidClassroomDocument(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().teacherUid == existing().teacherUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().enrolledCount >= 0 &&
+        incoming().enrolledCount <= 50 &&
+        incoming().maxCapacity == 50 &&
+        incoming().updatedAt == request.time &&
+        (request.auth.uid == existing().teacherUid || isSuperAdmin());
+
+      allow delete: if isSuperAdmin() && isValidId(classId);
+    }
+
+    // =========================================================================
+    // COLLECTION 7: /teacher_registrations/{registrationId}
+    // =========================================================================
+    match /teacher_registrations/{registrationId} {
+      allow get: if isSignedIn() && isValidId(registrationId) && (
+        resource.data.teacherUid == request.auth.uid || isSuperAdmin()
+      );
+
+      allow list: if isSignedIn() && resource.data.teacherUid == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(registrationId) &&
+        isValidTeacherRegistrationDocument(incoming()) &&
+        incoming().id == registrationId &&
+        incoming().teacherUid == request.auth.uid &&
+        incoming().approvalStatus in ['pending_verification', 'pending_admin_approval'] &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isSuperAdmin() &&
+        isValidId(registrationId) &&
+        isValidTeacherRegistrationDocument(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().teacherUid == existing().teacherUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isSuperAdmin() && isValidId(registrationId);
+    }
+  }
+}
