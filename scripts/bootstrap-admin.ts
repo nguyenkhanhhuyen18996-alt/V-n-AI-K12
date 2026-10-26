@@ -7,7 +7,7 @@ import {
   executeServerAdminBootstrap,
   getConfiguredFirstAdminUid,
   getFirebaseAdminStatus
-} from '../src/server/firebaseAdmin.js';
+} from '../src/server/firebaseAdmin.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

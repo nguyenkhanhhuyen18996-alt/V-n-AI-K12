@@ -1,8 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initializeApp, getApps, cert, App } from 'firebase-admin/app';
-import { getAuth, UserRecord } from 'firebase-admin/auth';
+import { initializeApp, getApps, cert, type App } from 'firebase-admin/app';
+import { getAuth, type UserRecord } from 'firebase-admin/auth';
 import { getFirestore as getAdminFirestore, FieldValue } from 'firebase-admin/firestore';
 
 const __filename = fileURLToPath(import.meta.url);

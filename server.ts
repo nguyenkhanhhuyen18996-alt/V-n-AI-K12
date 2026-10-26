@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import express, { Request, Response, NextFunction } from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -12,9 +12,9 @@ import {
   verifyFirebaseIdTokenOnServer,
   executeServerAdminBootstrap,
   syncTeacherRoleInFirestoreAdminSdk
-} from './src/server/firebaseAdmin.js';
+} from './src/server/firebaseAdmin.ts';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(process.cwd(), '.data');
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts_v2.json');
 const STUDENT_STATES_FILE = path.join(DATA_DIR, 'student_states_v2.json');
@@ -3788,7 +3788,7 @@ ${studentEssay}`;
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
+    app.get(/.*/, (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
