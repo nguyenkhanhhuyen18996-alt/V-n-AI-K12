@@ -50,12 +50,15 @@ export interface FirebaseAdminConfigStatus {
   missingEnvVars: string[];
 }
 
+let cachedAdminApp: App | null = null;
 let adminInitAttempted = false;
 let adminInitError: string | null = null;
 let detectedCredentialSource: 'FIREBASE_SERVICE_ACCOUNT_JSON' | 'GOOGLE_APPLICATION_CREDENTIALS' | 'none' = 'none';
 
 export function getConfiguredFirstAdminUid(): string {
-  return String(process.env.FIRST_ADMIN_UID || '').trim();
+  const raw = String(process.env.FIRST_ADMIN_UID || '').trim();
+  // Loại bỏ dấu ngoặc kép hoặc ngoặc đơn bao ngoài nếu người dùng dán kèm trong biến môi trường
+  return raw.replace(/^["']+|["']+$/g, '').trim();
 }
 
 export function maskUidForDisplay(uid: string): string | null {
@@ -65,14 +68,65 @@ export function maskUidForDisplay(uid: string): string | null {
   return `${clean.slice(0, 4)}...${clean.slice(-4)}`;
 }
 
+function parseServiceAccountJsonEnv(rawInput: string): Record<string, any> {
+  let cleaned = rawInput.trim();
+  if (
+    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+    (cleaned.startsWith("'") && cleaned.endsWith("'"))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    // Dự phòng trường hợp chuỗi JSON bị escape dấu ngoặc kép hoặc mã hóa Base64
+    try {
+      const unescaped = cleaned.replace(/\\"/g, '"');
+      parsed = JSON.parse(unescaped);
+    } catch {
+      const decodedBase64 = Buffer.from(cleaned, 'base64').toString('utf-8').trim();
+      parsed = JSON.parse(decodedBase64);
+    }
+  }
+
+  if (typeof parsed === 'string') {
+    parsed = JSON.parse(parsed);
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON không phải là đối tượng JSON hợp lệ.');
+  }
+
+  if (typeof parsed.private_key === 'string') {
+    parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+  }
+
+  return parsed;
+}
+
 /**
- * Khởi tạo Firebase Admin SDK an toàn phía máy chủ.
+ * Khởi tạo Firebase Admin SDK an toàn phía máy chủ và dùng lại instance (singleton)
+ * khi serverless function được gọi nhiều lần.
  * Tuyệt đối không đưa Service Account vào mã trình duyệt.
  */
 export function ensureFirebaseAdminInitialized(): App | null {
+  if (cachedAdminApp) {
+    return cachedAdminApp;
+  }
+
   const existingApps = getApps();
   if (existingApps.length > 0 && existingApps[0]) {
-    return existingApps[0];
+    cachedAdminApp = existingApps[0];
+    if (detectedCredentialSource === 'none') {
+      detectedCredentialSource = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+        ? 'FIREBASE_SERVICE_ACCOUNT_JSON'
+        : process.env.GOOGLE_APPLICATION_CREDENTIALS
+        ? 'GOOGLE_APPLICATION_CREDENTIALS'
+        : 'none';
+    }
+    return cachedAdminApp;
   }
 
   const appletConfig = loadFirebaseAppletConfig();
@@ -81,14 +135,15 @@ export function ensureFirebaseAdminInitialized(): App | null {
 
   try {
     if (serviceAccountJsonRaw) {
-      const parsed = JSON.parse(serviceAccountJsonRaw);
+      const parsed = parseServiceAccountJsonEnv(serviceAccountJsonRaw);
       detectedCredentialSource = 'FIREBASE_SERVICE_ACCOUNT_JSON';
       adminInitAttempted = true;
       adminInitError = null;
-      return initializeApp({
+      cachedAdminApp = initializeApp({
         credential: cert(parsed),
         projectId: parsed.project_id || appletConfig.projectId
       });
+      return cachedAdminApp;
     }
 
     if (googleCredsPath) {
@@ -97,24 +152,27 @@ export function ensureFirebaseAdminInitialized(): App | null {
         : path.resolve(ROOT_DIR, googleCredsPath);
       if (!fs.existsSync(resolvedPath)) {
         adminInitAttempted = true;
-        adminInitError = `Không tìm thấy tệp khóa dịch vụ tại GOOGLE_APPLICATION_CREDENTIALS="${resolvedPath}".`;
+        adminInitError = `Không tìm thấy tệp khóa dịch vụ tại GOOGLE_APPLICATION_CREDENTIALS.`;
         return null;
       }
-      const parsed = JSON.parse(fs.readFileSync(resolvedPath, 'utf-8'));
+      const parsed = parseServiceAccountJsonEnv(fs.readFileSync(resolvedPath, 'utf-8'));
       detectedCredentialSource = 'GOOGLE_APPLICATION_CREDENTIALS';
       adminInitAttempted = true;
       adminInitError = null;
-      return initializeApp({
+      cachedAdminApp = initializeApp({
         credential: cert(parsed),
         projectId: parsed.project_id || appletConfig.projectId
       });
+      return cachedAdminApp;
     }
 
     detectedCredentialSource = 'none';
+    adminInitError = null;
     return null;
   } catch (err: any) {
     adminInitAttempted = true;
-    adminInitError = err?.message || 'Lỗi khởi tạo Firebase Admin SDK.';
+    adminInitError =
+      err?.message || 'Lỗi khởi tạo Firebase Admin SDK từ biến môi trường máy chủ.';
     console.error('[FirebaseAdmin] Lỗi khởi tạo Firebase Admin SDK:', adminInitError);
     return null;
   }
@@ -123,14 +181,18 @@ export function ensureFirebaseAdminInitialized(): App | null {
 export function getFirebaseAdminStatus(): FirebaseAdminConfigStatus {
   const appletConfig = loadFirebaseAppletConfig();
   const firstAdminUid = getConfiguredFirstAdminUid();
+  const hasServiceAccountEnv = Boolean(
+    String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim() ||
+      String(process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim()
+  );
   const app = ensureFirebaseAdminInitialized();
   const missingEnvVars: string[] = [];
 
   if (!firstAdminUid) {
     missingEnvVars.push('FIRST_ADMIN_UID');
   }
-  if (!app) {
-    missingEnvVars.push('FIREBASE_SERVICE_ACCOUNT_JSON (hoặc GOOGLE_APPLICATION_CREDENTIALS)');
+  if (!hasServiceAccountEnv) {
+    missingEnvVars.push('FIREBASE_SERVICE_ACCOUNT_JSON');
   }
 
   return {

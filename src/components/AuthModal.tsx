@@ -12,6 +12,7 @@ import {
   checkTeacherBootstrapStatus,
   triggerServerAdminClaimBootstrap,
   ServerFirebaseAdminStatus,
+  AuthErrorCategory,
   submitTeacherRegistration,
   sendTeacherGmailOtp,
   verifyTeacherGmailOtp,
@@ -71,6 +72,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [serverAdminStatus, setServerAdminStatus] = useState<ServerFirebaseAdminStatus | null>(
     null
   );
+  const [statusCheckState, setStatusCheckState] = useState<'loading' | 'ready' | 'endpoint_error'>(
+    'loading'
+  );
+  const [statusEndpointError, setStatusEndpointError] = useState<string | null>(null);
   const [detectedFirebaseUid, setDetectedFirebaseUid] = useState<string | null>(
     auth.currentUser?.uid || null
   );
@@ -114,7 +119,25 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   // Trạng thái xử lý
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorCategory, setErrorCategory] = useState<AuthErrorCategory | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  const refreshServerConfigStatus = async () => {
+    setStatusCheckState('loading');
+    setStatusEndpointError(null);
+    const status = await checkTeacherBootstrapStatus();
+    if (status.endpointReachable && status.firebaseAdminStatus) {
+      setServerAdminStatus(status.firebaseAdminStatus);
+      setStatusCheckState('ready');
+    } else {
+      setServerAdminStatus(null);
+      setStatusCheckState('endpoint_error');
+      setStatusEndpointError(
+        status.endpointError ||
+          `Không nhận được phản hồi JSON hợp lệ từ /api/auth/bootstrap-status (HTTP ${status.httpStatus}).`
+      );
+    }
+  };
 
   useEffect(() => {
     if (!isOpen) return;
@@ -122,11 +145,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setDetectedFirebaseUid(auth.currentUser.uid);
       setDetectedFirebaseEmail(auth.currentUser.email);
     }
-    checkTeacherBootstrapStatus().then((status) => {
-      if (status.firebaseAdminStatus) {
-        setServerAdminStatus(status.firebaseAdminStatus);
-      }
-    });
+    refreshServerConfigStatus();
   }, [isOpen]);
 
   if (!isOpen) return null;
@@ -377,12 +396,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   // Đăng nhập qua Firebase Google Sign-In (Xác thực bằng Firebase ID Token & Custom Claim admin=true trên máy chủ)
   const handleGoogleLogin = async () => {
     setErrorMessage(null);
+    setErrorCategory(null);
     setSuccessMessage(null);
     setIsLoading(true);
 
     try {
       const res = await googleSignIn();
       if (!res?.user) {
+        setErrorCategory('TOKEN_ERROR');
         setErrorMessage('Không nhận diện được phiên đăng nhập từ Google Firebase Authentication.');
         return;
       }
@@ -397,6 +418,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         res.user.displayName || undefined
       );
 
+      await refreshServerConfigStatus();
+
       if (matchRes.matched && matchRes.user) {
         setSuccessMessage(
           `Xác thực Firebase (${res.user.email || res.user.uid}) thành công! Chào mừng ${matchRes.user.fullName}.`
@@ -409,12 +432,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         if (matchRes.firebaseUid) {
           setDetectedFirebaseUid(matchRes.firebaseUid);
         }
+        setErrorCategory(matchRes.errorCategory || null);
         setErrorMessage(
           matchRes.message ||
             `Tài khoản Firebase (${res.user.email || res.user.uid}) chưa được cấp quyền trong hệ thống.`
         );
       }
     } catch (err: any) {
+      setErrorCategory('TOKEN_ERROR');
       setErrorMessage(err.message || 'Lỗi kết nối dịch vụ Google Sign-In.');
     } finally {
       setIsLoading(false);
@@ -424,11 +449,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   // Làm mới Firebase ID Token (getIdToken(true)) sau khi đã cấp custom claim admin=true trên máy chủ
   const handleRefreshFirebaseAdminToken = async () => {
     setErrorMessage(null);
+    setErrorCategory(null);
     setSuccessMessage(null);
     setIsLoading(true);
     try {
+      await refreshServerConfigStatus();
       const freshToken = await getCurrentFirebaseIdToken(true);
       if (!freshToken) {
+        setErrorCategory('TOKEN_ERROR');
         setErrorMessage('Chưa có phiên Firebase Authentication. Vui lòng bấm "Đăng nhập với Google" trước.');
         return;
       }
@@ -447,12 +475,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           onClose();
         }, 500);
       } else {
+        setErrorCategory(matchRes.errorCategory || null);
         setErrorMessage(
           matchRes.message ||
-            'ID Token hiện tại vẫn chưa có custom claim admin=true. Hãy kiểm tra lại việc chạy `npm run bootstrap:admin` trên máy chủ.'
+            'Không thể xác thực quyền Quản trị viên với ID Token hiện tại.'
         );
       }
     } catch (err: any) {
+      setErrorCategory('TOKEN_ERROR');
       setErrorMessage(err.message || 'Lỗi khi làm mới Firebase ID Token.');
     } finally {
       setIsLoading(false);
@@ -462,16 +492,20 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   // Kích hoạt quy trình cấp custom claim admin=true trên máy chủ (chỉ hoạt động nếu UID khớp FIRST_ADMIN_UID)
   const handleTriggerServerAdminBootstrap = async () => {
     setErrorMessage(null);
+    setErrorCategory(null);
     setSuccessMessage(null);
     setIsLoading(true);
     try {
       const idToken = await getCurrentFirebaseIdToken(true);
       if (!idToken) {
+        setErrorCategory('TOKEN_ERROR');
         setErrorMessage('Vui lòng đăng nhập bằng Google (Firebase Auth) trước khi thực hiện.');
         return;
       }
       const bootRes = await triggerServerAdminClaimBootstrap(idToken);
+      await refreshServerConfigStatus();
       if (!bootRes.success) {
+        setErrorCategory(bootRes.errorCategory || null);
         setErrorMessage(bootRes.message);
         return;
       }
@@ -495,6 +529,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       }
       setSuccessMessage(bootRes.message);
     } catch (err: any) {
+      setErrorCategory('ENDPOINT_ERROR');
       setErrorMessage(err.message || 'Lỗi khi gọi quy trình Firebase Admin SDK trên máy chủ.');
     } finally {
       setIsLoading(false);
@@ -652,7 +687,22 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         {errorMessage && (
           <div className="mx-5 mt-4 p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-start gap-2">
             <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-            <div className="flex-1 leading-relaxed">{errorMessage}</div>
+            <div className="flex-1 leading-relaxed space-y-1">
+              {errorCategory && (
+                <div>
+                  <span className="inline-block px-2 py-0.5 rounded-md bg-rose-200/80 text-rose-950 font-bold text-[10px]">
+                    {errorCategory === 'ENDPOINT_ERROR'
+                      ? 'LỖI ENDPOINT API MÁY CHỦ'
+                      : errorCategory === 'CONFIG_ERROR'
+                      ? 'LỖI CẤU HÌNH MÁY CHỦ'
+                      : errorCategory === 'TOKEN_ERROR'
+                      ? 'LỖI FIREBASE ID TOKEN'
+                      : 'LỖI QUYỀN QUẢN TRỊ / PHÂN QUYỀN'}
+                  </span>
+                </div>
+              )}
+              <div>{errorMessage}</div>
+            </div>
           </div>
         )}
 
@@ -721,24 +771,43 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     {detectedFirebaseEmail ? ` (${detectedFirebaseEmail})` : ''}
                   </div>
 
-                  <div className="text-[11px] text-purple-900 space-y-1 leading-relaxed">
-                    <div>
-                      • Trạng thái <code>FIRST_ADMIN_UID</code> trên máy chủ:{' '}
-                      <strong>
-                        {serverAdminStatus?.firstAdminUidConfigured
-                          ? `Đã cấu hình (${serverAdminStatus.firstAdminUidMasked})`
-                          : 'Chưa cấu hình trong .env'}
-                      </strong>
+                  {statusCheckState === 'loading' && (
+                    <div className="text-[11px] text-purple-800 italic">
+                      Đang kiểm tra trạng thái cấu hình từ API máy chủ (/api/auth/bootstrap-status)...
                     </div>
-                    <div>
-                      • Khóa dịch vụ Firebase Admin SDK:{' '}
-                      <strong>
-                        {serverAdminStatus?.serviceAccountConfigured
-                          ? `Đã kết nối (${serverAdminStatus.credentialSource})`
-                          : 'Chưa cấu hình FIREBASE_SERVICE_ACCOUNT_JSON'}
-                      </strong>
+                  )}
+
+                  {statusCheckState === 'endpoint_error' && (
+                    <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-300 text-[11px] text-amber-950 space-y-1">
+                      <div className="font-bold">
+                        Không kết nối được API kiểm tra cấu hình máy chủ (Không phải lỗi thiếu biến .env):
+                      </div>
+                      <div>{statusEndpointError}</div>
                     </div>
-                  </div>
+                  )}
+
+                  {statusCheckState === 'ready' && serverAdminStatus && (
+                    <div className="text-[11px] text-purple-900 space-y-1 leading-relaxed">
+                      <div>
+                        • Trạng thái <code>FIRST_ADMIN_UID</code> trên máy chủ:{' '}
+                        <strong>
+                          {serverAdminStatus.firstAdminUidConfigured
+                            ? `Đã cấu hình trên máy chủ (${serverAdminStatus.firstAdminUidMasked})`
+                            : 'Chưa nhận được biến FIRST_ADMIN_UID trên máy chủ'}
+                        </strong>
+                      </div>
+                      <div>
+                        • Khóa dịch vụ Firebase Admin SDK:{' '}
+                        <strong>
+                          {serverAdminStatus.serviceAccountConfigured
+                            ? `Đã kết nối (${serverAdminStatus.credentialSource})`
+                            : serverAdminStatus.initializationError
+                            ? `Lỗi định dạng JSON (${serverAdminStatus.initializationError})`
+                            : 'Chưa nhận được biến FIREBASE_SERVICE_ACCOUNT_JSON trên máy chủ'}
+                        </strong>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="flex flex-wrap gap-2 pt-1">
                     <button

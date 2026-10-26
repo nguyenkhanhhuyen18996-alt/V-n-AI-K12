@@ -102,8 +102,129 @@ function getAuthHeaders(): Record<string, string> {
 }
 
 /**
+/**
  * Kiểm tra trạng thái khởi tạo hệ thống (Quản trị viên & cấu hình dịch vụ gửi email OTP)
  */
+export type AuthErrorCategory =
+  | 'CONFIG_ERROR'
+  | 'ENDPOINT_ERROR'
+  | 'TOKEN_ERROR'
+  | 'PERMISSION_ERROR';
+
+export interface SafeJsonResponse<T = any> {
+  ok: boolean;
+  status: number;
+  isJson: boolean;
+  data: T | null;
+  errorCategory?: AuthErrorCategory;
+  errorMessage?: string;
+}
+
+export async function safeFetchJson<T = any>(
+  url: string,
+  options?: RequestInit
+): Promise<SafeJsonResponse<T>> {
+  let res: Response;
+  try {
+    res = await fetch(url, options);
+  } catch (networkErr: any) {
+    return {
+      ok: false,
+      status: 0,
+      isJson: false,
+      data: null,
+      errorCategory: 'ENDPOINT_ERROR',
+      errorMessage: `Không thể kết nối tới API ${url} (${
+        networkErr?.message || 'Lỗi mạng'
+      }).`
+    };
+  }
+
+  const status = res.status;
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  let rawText = '';
+  try {
+    rawText = await res.text();
+  } catch (readErr: any) {
+    return {
+      ok: false,
+      status,
+      isJson: false,
+      data: null,
+      errorCategory: 'ENDPOINT_ERROR',
+      errorMessage: `Lỗi đọc phản hồi từ ${url} (HTTP ${status}): ${
+        readErr?.message || 'Không đọc được nội dung phản hồi'
+      }.`
+    };
+  }
+
+  const trimmed = rawText.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      status,
+      isJson: false,
+      data: null,
+      errorCategory: 'ENDPOINT_ERROR',
+      errorMessage: `Endpoint ${url} trả về phản hồi rỗng (HTTP ${status} ${
+        res.statusText || ''
+      }). Vui lòng kiểm tra triển khai Serverless Function /api trên Vercel.`
+    };
+  }
+
+  if (!contentType.includes('application/json') && trimmed.startsWith('<')) {
+    return {
+      ok: false,
+      status,
+      isJson: false,
+      data: null,
+      errorCategory: 'ENDPOINT_ERROR',
+      errorMessage: `Endpoint ${url} trả về HTML thay vì JSON (HTTP ${status}, Content-Type: ${
+        contentType || 'text/html'
+      }). Đường dẫn /api đang bị rewrite về trang tĩnh hoặc Serverless Function chưa được triển khai.`
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as T;
+    const anyParsed = parsed as any;
+    const categoryFromBody: AuthErrorCategory | undefined = anyParsed?.errorCategory;
+    return {
+      ok: res.ok,
+      status,
+      isJson: true,
+      data: parsed,
+      errorCategory:
+        categoryFromBody ||
+        (!res.ok
+          ? status === 401
+            ? 'TOKEN_ERROR'
+            : status === 403
+            ? 'PERMISSION_ERROR'
+            : status === 503
+            ? 'CONFIG_ERROR'
+            : 'ENDPOINT_ERROR'
+          : undefined),
+      errorMessage: !res.ok
+        ? anyParsed?.message ||
+          anyParsed?.error ||
+          `Máy chủ trả về mã lỗi HTTP ${status} tại ${url}.`
+        : undefined
+    };
+  } catch {
+    return {
+      ok: false,
+      status,
+      isJson: false,
+      data: null,
+      errorCategory: 'ENDPOINT_ERROR',
+      errorMessage: `Endpoint ${url} trả về dữ liệu không phải JSON hợp lệ (HTTP ${status}, Content-Type: ${
+        contentType || 'không xác định'
+      }).`
+    };
+  }
+}
+
 export interface ServerFirebaseAdminStatus {
   projectId: string;
   firestoreDatabaseId: string;
@@ -117,6 +238,9 @@ export interface ServerFirebaseAdminStatus {
 }
 
 export async function checkTeacherBootstrapStatus(): Promise<{
+  endpointReachable: boolean;
+  httpStatus: number;
+  endpointError?: string;
   needsAdminBootstrap: boolean;
   needsTeacherBootstrap: boolean;
   emailProviderStatus?: {
@@ -127,15 +251,25 @@ export async function checkTeacherBootstrapStatus(): Promise<{
   firebaseAdminStatus?: ServerFirebaseAdminStatus;
   totalAccounts: number;
 }> {
-  try {
-    const res = await fetch('/api/auth/bootstrap-status');
-    if (res.ok) {
-      return await res.json();
-    }
-  } catch (err) {
-    console.warn('Không kiểm tra được trạng thái khởi tạo:', err);
+  const result = await safeFetchJson<any>('/api/auth/bootstrap-status');
+  if (result.ok && result.isJson && result.data) {
+    return {
+      endpointReachable: true,
+      httpStatus: result.status,
+      needsAdminBootstrap: Boolean(result.data.needsAdminBootstrap),
+      needsTeacherBootstrap: Boolean(result.data.needsTeacherBootstrap),
+      emailProviderStatus: result.data.emailProviderStatus,
+      firebaseAdminStatus: result.data.firebaseAdminStatus,
+      totalAccounts: Number(result.data.totalAccounts || 0)
+    };
   }
+
   return {
+    endpointReachable: false,
+    httpStatus: result.status,
+    endpointError:
+      result.errorMessage ||
+      `Không kết nối được API kiểm tra cấu hình (/api/auth/bootstrap-status - HTTP ${result.status}).`,
     needsAdminBootstrap: false,
     needsTeacherBootstrap: false,
     totalAccounts: 0
@@ -151,29 +285,41 @@ export async function triggerServerAdminClaimBootstrap(
   firebaseIdToken: string
 ): Promise<{
   success: boolean;
+  httpStatus?: number;
+  errorCategory?: AuthErrorCategory;
   customClaimGranted?: boolean;
   firestoreAdminDocSynced?: boolean;
   message: string;
 }> {
-  try {
-    const res = await fetch('/api/auth/bootstrap-admin', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ firebaseIdToken })
-    });
-    const data = await res.json();
-    return {
-      success: Boolean(res.ok && data.success),
-      customClaimGranted: data.customClaimGranted,
-      firestoreAdminDocSynced: data.firestoreAdminDocSynced,
-      message: data.message || 'Không thể chạy quy trình khởi tạo Quản trị viên trên máy chủ.'
-    };
-  } catch (err: any) {
+  const result = await safeFetchJson<any>('/api/auth/bootstrap-admin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ firebaseIdToken })
+  });
+
+  if (!result.isJson || !result.data) {
     return {
       success: false,
-      message: 'Lỗi kết nối máy chủ: ' + (err.message || '')
+      httpStatus: result.status,
+      errorCategory: 'ENDPOINT_ERROR',
+      message:
+        result.errorMessage ||
+        `Lỗi kết nối endpoint /api/auth/bootstrap-admin (HTTP ${result.status}).`
     };
   }
+
+  const data = result.data;
+  return {
+    success: Boolean(result.ok && data.success),
+    httpStatus: result.status,
+    errorCategory: result.errorCategory,
+    customClaimGranted: data.customClaimGranted,
+    firestoreAdminDocSynced: data.firestoreAdminDocSynced,
+    message:
+      data.message ||
+      result.errorMessage ||
+      `Không thể chạy quy trình khởi tạo Quản trị viên trên máy chủ (HTTP ${result.status}).`
+  };
 }
 
 // ============================================================================
@@ -459,32 +605,37 @@ export async function authenticateWithCredentials(
   registrationId?: string;
   message?: string;
 }> {
-  try {
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password: plainPassword })
-    });
-    const data = await res.json();
-    if (res.ok && data.success && data.user && data.sessionToken) {
-      saveAuthSession(data.user, data.sessionToken, data.adminApprovalSignature);
-      if (data.user.role === 'teacher' || data.user.role === 'admin') {
-        await initializeAccounts();
-      }
-      return { success: true, user: data.user };
-    }
+  const result = await safeFetchJson<any>('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password: plainPassword })
+  });
+
+  if (!result.isJson || !result.data) {
     return {
       success: false,
-      code: data.code,
-      registrationId: data.registrationId,
-      message: data.message || 'Đăng nhập không thành công. Vui lòng kiểm tra lại thông tin.'
-    };
-  } catch (err: any) {
-    return {
-      success: false,
-      message: 'Lỗi kết nối máy chủ xác thực: ' + (err.message || 'Vui lòng thử lại.')
+      message:
+        result.errorMessage ||
+        `Lỗi kết nối endpoint xác thực /api/auth/login (HTTP ${result.status}).`
     };
   }
+
+  const data = result.data;
+  if (result.ok && data.success && data.user && data.sessionToken) {
+    saveAuthSession(data.user, data.sessionToken, data.adminApprovalSignature);
+    if (data.user.role === 'teacher' || data.user.role === 'admin') {
+      await initializeAccounts();
+    }
+    return { success: true, user: data.user };
+  }
+  return {
+    success: false,
+    code: data.code,
+    registrationId: data.registrationId,
+    message:
+      data.message ||
+      `Đăng nhập không thành công (HTTP ${result.status}). Vui lòng kiểm tra lại thông tin.`
+  };
 }
 
 /**
@@ -495,31 +646,34 @@ export async function activateStudentAccount(
   activationCode: string,
   newPassword: string
 ): Promise<{ success: boolean; user?: UserAccount; message?: string }> {
-  try {
-    const res = await fetch('/api/auth/activate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, activationCode, newPassword })
-    });
-    const data = await res.json();
-    if (res.ok && data.success && data.user && data.sessionToken) {
-      saveAuthSession(data.user, data.sessionToken);
-      return {
-        success: true,
-        user: data.user,
-        message: data.message || 'Kích hoạt tài khoản thành công!'
-      };
-    }
+  const result = await safeFetchJson<any>('/api/auth/activate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, activationCode, newPassword })
+  });
+
+  if (!result.isJson || !result.data) {
     return {
       success: false,
-      message: data.message || 'Kích hoạt không thành công.'
-    };
-  } catch (err: any) {
-    return {
-      success: false,
-      message: 'Lỗi kết nối máy chủ khi kích hoạt: ' + (err.message || '')
+      message:
+        result.errorMessage ||
+        `Lỗi kết nối endpoint kích hoạt /api/auth/activate (HTTP ${result.status}).`
     };
   }
+
+  const data = result.data;
+  if (result.ok && data.success && data.user && data.sessionToken) {
+    saveAuthSession(data.user, data.sessionToken);
+    return {
+      success: true,
+      user: data.user,
+      message: data.message || 'Kích hoạt tài khoản thành công!'
+    };
+  }
+  return {
+    success: false,
+    message: data.message || `Kích hoạt không thành công (HTTP ${result.status}).`
+  };
 }
 
 /**
@@ -534,42 +688,54 @@ export async function matchAccountByGoogleEmail(
   user?: UserAccount;
   firebaseUid?: string;
   code?: string;
+  httpStatus?: number;
+  errorCategory?: AuthErrorCategory;
   adminApprovalSignature?: string;
   message?: string;
 }> {
-  try {
-    const res = await fetch('/api/auth/google-match', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ firebaseIdToken, displayName })
-    });
-    const data = await res.json();
-    if (res.ok && data.matched && data.user && data.sessionToken) {
-      saveAuthSession(data.user, data.sessionToken, data.adminApprovalSignature);
-      if (data.user.role === 'teacher' || data.user.role === 'admin') {
-        await initializeAccounts();
-      }
-      return {
-        matched: true,
-        user: data.user,
-        firebaseUid: data.firebaseUid,
-        adminApprovalSignature: data.adminApprovalSignature
-      };
-    }
+  const result = await safeFetchJson<any>('/api/auth/google-match', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ firebaseIdToken, displayName })
+  });
+
+  if (!result.isJson || !result.data) {
     return {
       matched: false,
-      firebaseUid: data.firebaseUid,
-      code: data.code,
+      httpStatus: result.status,
+      errorCategory: 'ENDPOINT_ERROR',
       message:
-        data.message ||
-        'Tài khoản Firebase hiện tại chưa được cấp quyền truy cập trong hệ thống.'
-    };
-  } catch (err: any) {
-    return {
-      matched: false,
-      message: 'Lỗi xác thực Firebase ID Token với máy chủ: ' + (err.message || '')
+        result.errorMessage ||
+        `Lỗi kết nối endpoint xác thực /api/auth/google-match (HTTP ${result.status}).`
     };
   }
+
+  const data = result.data;
+  if (result.ok && data.matched && data.user && data.sessionToken) {
+    saveAuthSession(data.user, data.sessionToken, data.adminApprovalSignature);
+    if (data.user.role === 'teacher' || data.user.role === 'admin') {
+      await initializeAccounts();
+    }
+    return {
+      matched: true,
+      httpStatus: result.status,
+      user: data.user,
+      firebaseUid: data.firebaseUid,
+      adminApprovalSignature: data.adminApprovalSignature
+    };
+  }
+
+  return {
+    matched: false,
+    httpStatus: result.status,
+    errorCategory: data.errorCategory || result.errorCategory,
+    firebaseUid: data.firebaseUid,
+    code: data.code,
+    message:
+      data.message ||
+      result.errorMessage ||
+      `Tài khoản Firebase hiện tại chưa được cấp quyền truy cập trong hệ thống (HTTP ${result.status}).`
+  };
 }
 
 /**
@@ -580,23 +746,27 @@ export async function changeUserPassword(
   oldPass: string,
   newPass: string
 ): Promise<{ success: boolean; message: string }> {
-  try {
-    const res = await fetch('/api/auth/change-password', {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: JSON.stringify({ userId, oldPass, newPass })
-    });
-    const data = await res.json();
-    return {
-      success: Boolean(res.ok && data.success),
-      message: data.message || (res.ok ? 'Đổi mật khẩu thành công!' : 'Không thể đổi mật khẩu.')
-    };
-  } catch (err: any) {
+  const result = await safeFetchJson<any>('/api/auth/change-password', {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ userId, oldPass, newPass })
+  });
+
+  if (!result.isJson || !result.data) {
     return {
       success: false,
-      message: 'Lỗi kết nối máy chủ: ' + (err.message || '')
+      message:
+        result.errorMessage ||
+        `Lỗi kết nối endpoint /api/auth/change-password (HTTP ${result.status}).`
     };
   }
+
+  return {
+    success: Boolean(result.ok && result.data.success),
+    message:
+      result.data.message ||
+      (result.ok ? 'Đổi mật khẩu thành công!' : `Không thể đổi mật khẩu (HTTP ${result.status}).`)
+  };
 }
 
 /**

@@ -4,18 +4,16 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import nodemailer from 'nodemailer';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
-import {
-  getConfiguredFirstAdminUid,
-  getFirebaseAdminStatus,
-  verifyFirebaseIdTokenOnServer,
-  executeServerAdminBootstrap,
-  syncTeacherRoleInFirestoreAdminSdk
-} from './src/server/firebaseAdmin.ts';
+import { initializeApp, getApps, cert, type App } from 'firebase-admin/app';
+import { getAuth, type UserRecord } from 'firebase-admin/auth';
+import { getFirestore as getAdminFirestore, FieldValue } from 'firebase-admin/firestore';
 
 const PORT = Number(process.env.PORT) || 3000;
-const DATA_DIR = path.resolve(process.cwd(), '.data');
+const IS_VERCEL_RUNTIME = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+const DATA_DIR = IS_VERCEL_RUNTIME
+  ? path.join('/tmp', 'vanai12_data')
+  : path.resolve(process.cwd(), '.data');
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts_v2.json');
 const STUDENT_STATES_FILE = path.join(DATA_DIR, 'student_states_v2.json');
 const TEACHER_REGISTRATIONS_FILE = path.join(DATA_DIR, 'teacher_registrations_v2.json');
@@ -25,13 +23,483 @@ const ADMIN_AUDIT_LOGS_FILE = path.join(DATA_DIR, 'admin_audit_logs_v2.json');
 const MAX_ACTIVE_CLASSES_PER_TEACHER = 5;
 const MAX_ENROLLED_STUDENTS_PER_CLASS = 50;
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+try {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+} catch (err) {
+  console.warn('[Server] Không thể khởi tạo thư mục dữ liệu cục bộ:', err);
 }
 
 const SESSION_SECRET =
   process.env.SESSION_SECRET ||
   crypto.createHash('sha256').update(`${process.cwd()}:vanai12_hmac_secret_v2`).digest('hex');
+
+// ============================================================================
+// SERVER-SIDE FIREBASE ADMIN SDK SINGLETON & TOKEN / CLAIM VERIFICATION
+// ============================================================================
+export interface FirebaseAdminConfigStatus {
+  projectId: string;
+  firestoreDatabaseId: string;
+  firstAdminUidConfigured: boolean;
+  firstAdminUidMasked: string | null;
+  serviceAccountConfigured: boolean;
+  credentialSource: 'FIREBASE_SERVICE_ACCOUNT_JSON' | 'GOOGLE_APPLICATION_CREDENTIALS' | 'none';
+  adminSdkInitialized: boolean;
+  initializationError: string | null;
+  missingEnvVars: string[];
+}
+
+let cachedAdminApp: App | null = null;
+let adminInitError: string | null = null;
+let detectedCredentialSource:
+  | 'FIREBASE_SERVICE_ACCOUNT_JSON'
+  | 'GOOGLE_APPLICATION_CREDENTIALS'
+  | 'none' = 'none';
+
+export function getConfiguredFirstAdminUid(): string {
+  const raw = String(process.env.FIRST_ADMIN_UID || '').trim();
+  return raw.replace(/^["']+|["']+$/g, '').trim();
+}
+
+function maskUidForDisplay(uid: string): string | null {
+  const clean = String(uid || '').trim();
+  if (!clean) return null;
+  if (clean.length <= 8) return `${clean.slice(0, 2)}***${clean.slice(-2)}`;
+  return `${clean.slice(0, 4)}...${clean.slice(-4)}`;
+}
+
+function parseServiceAccountJsonEnv(rawInput: string): Record<string, any> {
+  let cleaned = rawInput.trim();
+  if (
+    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+    (cleaned.startsWith("'") && cleaned.endsWith("'"))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    try {
+      const unescaped = cleaned.replace(/\\"/g, '"');
+      parsed = JSON.parse(unescaped);
+    } catch {
+      const decodedBase64 = Buffer.from(cleaned, 'base64').toString('utf-8').trim();
+      parsed = JSON.parse(decodedBase64);
+    }
+  }
+
+  if (typeof parsed === 'string') {
+    parsed = JSON.parse(parsed);
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON không phải là đối tượng JSON hợp lệ.');
+  }
+
+  if (typeof parsed.private_key === 'string') {
+    parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+  }
+
+  return parsed;
+}
+
+export function ensureFirebaseAdminInitialized(): App | null {
+  if (cachedAdminApp) {
+    return cachedAdminApp;
+  }
+
+  const existingApps = getApps();
+  if (existingApps.length > 0 && existingApps[0]) {
+    cachedAdminApp = existingApps[0];
+    if (detectedCredentialSource === 'none') {
+      detectedCredentialSource = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+        ? 'FIREBASE_SERVICE_ACCOUNT_JSON'
+        : process.env.GOOGLE_APPLICATION_CREDENTIALS
+        ? 'GOOGLE_APPLICATION_CREDENTIALS'
+        : 'none';
+    }
+    return cachedAdminApp;
+  }
+
+  const appletConfig = getFirebaseProjectConfig();
+  const serviceAccountJsonRaw = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+  const googleCredsPath = String(process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+
+  try {
+    if (serviceAccountJsonRaw) {
+      const parsed = parseServiceAccountJsonEnv(serviceAccountJsonRaw);
+      detectedCredentialSource = 'FIREBASE_SERVICE_ACCOUNT_JSON';
+      adminInitError = null;
+      cachedAdminApp = initializeApp({
+        credential: cert(parsed),
+        projectId: parsed.project_id || appletConfig.projectId
+      });
+      return cachedAdminApp;
+    }
+
+    if (googleCredsPath) {
+      const resolvedPath = path.isAbsolute(googleCredsPath)
+        ? googleCredsPath
+        : path.resolve(process.cwd(), googleCredsPath);
+      if (!fs.existsSync(resolvedPath)) {
+        adminInitError = 'Không tìm thấy tệp khóa dịch vụ tại GOOGLE_APPLICATION_CREDENTIALS.';
+        return null;
+      }
+      const parsed = parseServiceAccountJsonEnv(fs.readFileSync(resolvedPath, 'utf-8'));
+      detectedCredentialSource = 'GOOGLE_APPLICATION_CREDENTIALS';
+      adminInitError = null;
+      cachedAdminApp = initializeApp({
+        credential: cert(parsed),
+        projectId: parsed.project_id || appletConfig.projectId
+      });
+      return cachedAdminApp;
+    }
+
+    detectedCredentialSource = 'none';
+    adminInitError = null;
+    return null;
+  } catch (err: any) {
+    adminInitError =
+      err?.message || 'Lỗi khởi tạo Firebase Admin SDK từ biến môi trường máy chủ.';
+    console.error('[FirebaseAdmin] Lỗi khởi tạo Firebase Admin SDK:', adminInitError);
+    return null;
+  }
+}
+
+export function getFirebaseAdminStatus(): FirebaseAdminConfigStatus {
+  const appletConfig = getFirebaseProjectConfig();
+  const firstAdminUid = getConfiguredFirstAdminUid();
+  const hasServiceAccountEnv = Boolean(
+    String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim() ||
+      String(process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim()
+  );
+  const app = ensureFirebaseAdminInitialized();
+  const missingEnvVars: string[] = [];
+
+  if (!firstAdminUid) {
+    missingEnvVars.push('FIRST_ADMIN_UID');
+  }
+  if (!hasServiceAccountEnv) {
+    missingEnvVars.push('FIREBASE_SERVICE_ACCOUNT_JSON');
+  }
+
+  return {
+    projectId: String(appletConfig.projectId || process.env.FIREBASE_PROJECT_ID || ''),
+    firestoreDatabaseId: String(
+      (appletConfig as any).firestoreDatabaseId || process.env.FIRESTORE_DATABASE_ID || '(default)'
+    ),
+    firstAdminUidConfigured: Boolean(firstAdminUid),
+    firstAdminUidMasked: maskUidForDisplay(firstAdminUid),
+    serviceAccountConfigured: Boolean(app),
+    credentialSource: detectedCredentialSource,
+    adminSdkInitialized: Boolean(app),
+    initializationError: adminInitError,
+    missingEnvVars
+  };
+}
+
+function decodeJwtPayloadUnsafe(idToken: string): Record<string, any> | null {
+  try {
+    const parts = idToken.split('.');
+    if (parts.length !== 3) return null;
+    const json = Buffer.from(parts[1], 'base64url').toString('utf-8');
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+export interface VerifiedFirebaseTokenResult {
+  valid: boolean;
+  uid?: string;
+  email?: string;
+  emailVerified?: boolean;
+  displayName?: string;
+  phoneNumber?: string;
+  isAdminClaim?: boolean;
+  verifiedBy: 'firebase_admin_sdk' | 'identity_toolkit_api' | 'none';
+  error?: string;
+}
+
+export async function verifyFirebaseIdTokenOnServer(
+  idToken: string
+): Promise<VerifiedFirebaseTokenResult> {
+  const cleanToken = String(idToken || '').trim();
+  if (!cleanToken || cleanToken.length < 30) {
+    return {
+      valid: false,
+      verifiedBy: 'none',
+      error: 'Thiếu Firebase ID Token hợp lệ từ phiên đăng nhập.'
+    };
+  }
+
+  const adminApp = ensureFirebaseAdminInitialized();
+  if (adminApp) {
+    try {
+      const decoded = await getAuth(adminApp).verifyIdToken(cleanToken, true);
+      return {
+        valid: true,
+        uid: decoded.uid,
+        email: decoded.email,
+        emailVerified: Boolean(decoded.email_verified),
+        displayName: (decoded as any).name || undefined,
+        phoneNumber: decoded.phone_number,
+        isAdminClaim: decoded.admin === true || (decoded as any).role === 'admin',
+        verifiedBy: 'firebase_admin_sdk'
+      };
+    } catch (err: any) {
+      return {
+        valid: false,
+        verifiedBy: 'firebase_admin_sdk',
+        error: `Xác thực Firebase ID Token bằng Firebase Admin SDK thất bại: ${
+          err?.message || 'Token không hợp lệ hoặc đã hết hạn.'
+        }`
+      };
+    }
+  }
+
+  const appletConfig = getFirebaseProjectConfig();
+  const webApiKey = String(appletConfig.apiKey || process.env.FIREBASE_WEB_API_KEY || '').trim();
+  if (!webApiKey) {
+    return {
+      valid: false,
+      verifiedBy: 'none',
+      error: 'Máy chủ chưa có cấu hình Firebase API Key hoặc Firebase Admin Service Account.'
+    };
+  }
+
+  try {
+    const verifyRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
+        webApiKey
+      )}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken: cleanToken })
+      }
+    );
+
+    if (!verifyRes.ok) {
+      const errData: any = await verifyRes.json().catch(() => ({}));
+      return {
+        valid: false,
+        verifiedBy: 'identity_toolkit_api',
+        error: `Token Firebase không hợp lệ (${errData?.error?.message || verifyRes.statusText}).`
+      };
+    }
+
+    const lookupData: any = await verifyRes.json();
+    const fbUser = lookupData?.users?.[0];
+    if (!fbUser || !fbUser.localId) {
+      return {
+        valid: false,
+        verifiedBy: 'identity_toolkit_api',
+        error: 'Không tìm thấy người dùng Firebase tương ứng với ID Token.'
+      };
+    }
+
+    if (fbUser.disabled) {
+      return {
+        valid: false,
+        verifiedBy: 'identity_toolkit_api',
+        error: 'Tài khoản Firebase này đã bị vô hiệu hóa.'
+      };
+    }
+
+    const jwtPayload = decodeJwtPayloadUnsafe(cleanToken) || {};
+    let customAttrs: Record<string, any> = {};
+    if (typeof fbUser.customAttributes === 'string') {
+      try {
+        customAttrs = JSON.parse(fbUser.customAttributes);
+      } catch {
+        customAttrs = {};
+      }
+    }
+
+    const isAdminClaim =
+      jwtPayload.admin === true ||
+      jwtPayload.role === 'admin' ||
+      customAttrs.admin === true ||
+      customAttrs.role === 'admin';
+
+    return {
+      valid: true,
+      uid: String(fbUser.localId),
+      email: fbUser.email ? String(fbUser.email).toLowerCase() : jwtPayload.email,
+      emailVerified: Boolean(fbUser.emailVerified),
+      displayName: fbUser.displayName || jwtPayload.name,
+      phoneNumber: fbUser.phoneNumber || jwtPayload.phone_number,
+      isAdminClaim,
+      verifiedBy: 'identity_toolkit_api'
+    };
+  } catch (err: any) {
+    return {
+      valid: false,
+      verifiedBy: 'identity_toolkit_api',
+      error: `Lỗi kết nối khi xác thực Firebase ID Token: ${err?.message || ''}`
+    };
+  }
+}
+
+export async function executeServerAdminBootstrap(explicitUid?: string): Promise<{
+  success: boolean;
+  uid: string;
+  email?: string;
+  displayName?: string;
+  customClaimSet: boolean;
+  firestoreAdminDocSynced: boolean;
+  firestoreError?: string;
+  message: string;
+}> {
+  const targetUid = String(explicitUid || getConfiguredFirstAdminUid()).trim();
+  if (!targetUid) {
+    throw new Error('Chưa cấu hình biến môi trường FIRST_ADMIN_UID ở phía máy chủ.');
+  }
+
+  const configuredUid = getConfiguredFirstAdminUid();
+  if (configuredUid && targetUid !== configuredUid) {
+    throw new Error(
+      'Từ chối khởi tạo: UID yêu cầu không khớp với FIRST_ADMIN_UID trong cấu hình bảo mật của máy chủ.'
+    );
+  }
+
+  const adminApp = ensureFirebaseAdminInitialized();
+  if (!adminApp) {
+    const status = getFirebaseAdminStatus();
+    throw new Error(
+      status.initializationError ||
+        `Chưa cấu hình khóa dịch vụ Firebase Admin SDK phía máy chủ (${status.missingEnvVars.join(
+          ', '
+        )}).`
+    );
+  }
+
+  const adminAuth = getAuth(adminApp);
+  let userRecord: UserRecord;
+  try {
+    userRecord = await adminAuth.getUser(targetUid);
+  } catch (err: any) {
+    throw new Error(
+      `Không tìm thấy tài khoản có UID "${targetUid}" trong Firebase Authentication của dự án (${
+        err?.message || 'user-not-found'
+      }).`
+    );
+  }
+
+  const existingClaims = userRecord.customClaims || {};
+  await adminAuth.setCustomUserClaims(targetUid, {
+    ...existingClaims,
+    admin: true,
+    role: 'admin'
+  });
+
+  const appletConfig: any = getFirebaseProjectConfig();
+  let firestoreAdminDocSynced = false;
+  let firestoreError: string | undefined;
+
+  try {
+    const dbId = appletConfig.firestoreDatabaseId || process.env.FIRESTORE_DATABASE_ID;
+    const db = dbId ? getAdminFirestore(adminApp, dbId) : getAdminFirestore(adminApp);
+    const now = FieldValue.serverTimestamp();
+
+    await db
+      .collection('admins')
+      .doc(targetUid)
+      .set(
+        {
+          uid: targetUid,
+          role: 'admin',
+          approvalSignature: `firebase-admin-sdk-claim-${Date.now()}`,
+          bootstrappedBy: 'firebase-admin-sdk',
+          createdAt: now,
+          updatedAt: now
+        },
+        { merge: true }
+      );
+
+    await db
+      .collection('users')
+      .doc(targetUid)
+      .set(
+        {
+          uid: targetUid,
+          username: `ADMIN-${targetUid.slice(0, 6).toUpperCase()}`,
+          fullName: userRecord.displayName || userRecord.email || 'Quản trị viên Hệ thống',
+          role: 'admin',
+          className: 'Hệ thống',
+          status: 'active',
+          surveyCompleted: true,
+          targetScore: 9.0,
+          quickFocusArea: 'balanced',
+          quickDailyTime: '30_mins',
+          createdAt: now,
+          updatedAt: now
+        },
+        { merge: true }
+      );
+
+    firestoreAdminDocSynced = true;
+  } catch (err: any) {
+    firestoreError = err?.message || String(err);
+    console.warn(
+      '[FirebaseAdmin] Đã cấp custom claim admin=true nhưng chưa ghi được vào Firestore:',
+      firestoreError
+    );
+  }
+
+  return {
+    success: true,
+    uid: targetUid,
+    email: userRecord.email || undefined,
+    displayName: userRecord.displayName || undefined,
+    customClaimSet: true,
+    firestoreAdminDocSynced,
+    firestoreError,
+    message: `Đã cấp custom claim { admin: true } trên Firebase Authentication cho UID "${targetUid}" (${
+      userRecord.email || 'không có email'
+    }).`
+  };
+}
+
+export async function syncTeacherRoleInFirestoreAdminSdk(params: {
+  teacherUid: string;
+  approved: boolean;
+  reviewedByUid: string;
+}): Promise<boolean> {
+  const adminApp = ensureFirebaseAdminInitialized();
+  if (!adminApp) return false;
+
+  try {
+    const appletConfig: any = getFirebaseProjectConfig();
+    const dbId = appletConfig.firestoreDatabaseId || process.env.FIRESTORE_DATABASE_ID;
+    const db = dbId ? getAdminFirestore(adminApp, dbId) : getAdminFirestore(adminApp);
+    const docRef = db.collection('admins').doc(params.teacherUid);
+
+    if (params.approved) {
+      await docRef.set(
+        {
+          uid: params.teacherUid,
+          role: 'teacher',
+          approvedByUid: params.reviewedByUid,
+          approvalSignature: `approved-by-${params.reviewedByUid}-${Date.now()}`,
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
+    } else {
+      await docRef.delete();
+    }
+    return true;
+  } catch (err) {
+    console.warn('[FirebaseAdmin] Không đồng bộ được /admins/{teacherUid} trên Firestore:', err);
+    return false;
+  }
+}
 
 // Read Firebase project config for server-side Firebase Phone Auth token verification
 function getFirebaseProjectConfig(): { projectId?: string; apiKey?: string } {
@@ -907,7 +1375,7 @@ function sanitizeRegistrationForClient(
   };
 }
 
-async function startServer() {
+export function createApiApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
@@ -926,7 +1394,7 @@ async function startServer() {
     const hasTeacherAccount = accounts.some(
       (a) => a.role === 'teacher' && a.status === 'active' && a.teacherApprovalStatus === 'approved'
     );
-    res.json({
+    res.status(200).json({
       status: 'ok',
       geminiConfigured: Boolean(getResolvedGeminiApiKey()),
       emailProviderStatus: getEmailProviderStatus(),
@@ -937,9 +1405,10 @@ async function startServer() {
     });
   });
 
-  app.get('/api/auth/bootstrap-status', (_req, res) => {
+  const handleBootstrapStatus = (_req: Request, res: Response) => {
     const accounts = loadServerAccounts();
     const configuredUid = getConfiguredFirstAdminUid();
+    const adminStatus = getFirebaseAdminStatus();
     const hasAdminAccount = accounts.some(
       (a) =>
         a.role === 'admin' &&
@@ -949,35 +1418,58 @@ async function startServer() {
     const hasTeacherAccount = accounts.some(
       (a) => a.role === 'teacher' && a.status === 'active' && a.teacherApprovalStatus === 'approved'
     );
-    res.json({
+    res.status(200).json({
+      status: 'ok',
       needsAdminBootstrap: !hasAdminAccount,
       needsTeacherBootstrap: !hasTeacherAccount,
       emailProviderStatus: getEmailProviderStatus(),
-      firebaseAdminStatus: getFirebaseAdminStatus(),
-      totalAccounts: accounts.length
+      firebaseAdminStatus: adminStatus,
+      totalAccounts: accounts.length,
+      timestamp: new Date().toISOString()
     });
-  });
+  };
+
+  app.get('/api/auth/bootstrap-status', handleBootstrapStatus);
+  app.get('/api/admin/config-status', handleBootstrapStatus);
 
   // Khoá hoàn toàn việc tự tạo hoặc tự nâng quyền Quản trị viên qua biểu mẫu giao diện.
   // Chỉ cho phép kích hoạt quy trình Firebase Admin SDK nếu người gọi cung cấp Firebase ID Token hợp lệ
-  // trùng khớp với FIRST_ADMIN_UID đã được cấu hình trong tệp .env phía máy chủ.
+  // trùng khớp với FIRST_ADMIN_UID đã được cấu hình ở phía máy chủ.
   app.post('/api/auth/bootstrap-admin', async (req, res) => {
     const { firebaseIdToken } = req.body || {};
     if (!firebaseIdToken) {
       res.status(403).json({
         success: false,
+        errorCategory: 'PERMISSION_ERROR',
+        code: 'MISSING_FIREBASE_ID_TOKEN',
         message:
-          'Từ chối truy cập (403): Hệ thống không cho phép tự đăng ký hoặc tự nâng quyền Quản trị viên qua giao diện. Quản trị viên đầu tiên phải được khởi tạo ở phía máy chủ bằng Firebase Admin SDK (cấu hình FIRST_ADMIN_UID trong .env và chạy `npm run bootstrap:admin`).'
+          'Từ chối truy cập (403): Hệ thống không cho phép tự đăng ký hoặc tự nâng quyền Quản trị viên qua giao diện. Quản trị viên đầu tiên phải được xác thực bằng Firebase ID Token khớp với FIRST_ADMIN_UID ở phía máy chủ.'
       });
       return;
     }
 
+    const adminStatus = getFirebaseAdminStatus();
     const configuredUid = getConfiguredFirstAdminUid();
     if (!configuredUid) {
-      res.status(403).json({
+      res.status(503).json({
         success: false,
+        errorCategory: 'CONFIG_ERROR',
+        code: 'FIRST_ADMIN_UID_NOT_CONFIGURED',
         message:
-          'Máy chủ chưa cấu hình FIRST_ADMIN_UID trong tệp .env. Vui lòng thiết lập FIRST_ADMIN_UID=<UID_CỦA_BẠN> trên máy chủ trước.'
+          'Lỗi cấu hình máy chủ (503): Máy chủ chưa đọc được biến môi trường FIRST_ADMIN_UID. Hãy kiểm tra biến FIRST_ADMIN_UID trên môi trường máy chủ (hoặc Redeploy trên Vercel sau khi lưu Environment Variables).'
+      });
+      return;
+    }
+
+    if (!adminStatus.serviceAccountConfigured) {
+      res.status(503).json({
+        success: false,
+        errorCategory: 'CONFIG_ERROR',
+        code: 'ADMIN_SDK_NOT_CONFIGURED',
+        message:
+          adminStatus.initializationError
+            ? `Lỗi cấu hình FIREBASE_SERVICE_ACCOUNT_JSON trên máy chủ: ${adminStatus.initializationError}`
+            : 'Lỗi cấu hình máy chủ (503): Máy chủ chưa đọc được biến môi trường FIREBASE_SERVICE_ACCOUNT_JSON.'
       });
       return;
     }
@@ -986,6 +1478,8 @@ async function startServer() {
     if (!verifiedToken.valid || !verifiedToken.uid) {
       res.status(401).json({
         success: false,
+        errorCategory: 'TOKEN_ERROR',
+        code: 'INVALID_FIREBASE_TOKEN',
         message: verifiedToken.error || 'Firebase ID Token không hợp lệ hoặc đã hết hạn.'
       });
       return;
@@ -994,7 +1488,9 @@ async function startServer() {
     if (verifiedToken.uid !== configuredUid) {
       res.status(403).json({
         success: false,
-        message: `Từ chối truy cập (403): UID tài khoản hiện tại (${verifiedToken.uid}) không khớp với FIRST_ADMIN_UID được cấu hình trên máy chủ.`
+        errorCategory: 'PERMISSION_ERROR',
+        code: 'ADMIN_UID_MISMATCH',
+        message: `Từ chối quyền Quản trị viên (403): UID tài khoản hiện tại (${verifiedToken.uid}) không khớp với FIRST_ADMIN_UID được cấu hình trên máy chủ.`
       });
       return;
     }
@@ -1031,17 +1527,18 @@ async function startServer() {
       }
       saveServerAccounts(accounts);
 
-      res.json({
+      res.status(200).json({
         success: true,
         customClaimGranted: true,
         firestoreAdminDocSynced: execResult.firestoreAdminDocSynced,
         message:
           execResult.message +
-          ' Vui lòng làm mới phiên đăng nhập (hoặc đăng xuất rồi đăng nhập lại) để nhận ID Token mới có custom claim admin=true.'
+          ' Phiên Quản trị viên đã được kích hoạt.'
       });
     } catch (err: any) {
       res.status(400).json({
         success: false,
+        errorCategory: 'CONFIG_ERROR',
         message: err?.message || 'Lỗi khi chạy quy trình Firebase Admin SDK trên máy chủ.'
       });
     }
@@ -2037,6 +2534,8 @@ async function startServer() {
       if (!verifiedUid) {
         res.status(401).json({
           matched: false,
+          errorCategory: 'TOKEN_ERROR',
+          code: 'INVALID_PROOF_TOKEN',
           message: 'Chữ ký kiểm thử Quản trị viên không hợp lệ hoặc đã hết hạn.'
         });
         return;
@@ -2046,6 +2545,8 @@ async function startServer() {
       if (!tokenCheck.valid || !tokenCheck.uid) {
         res.status(401).json({
           matched: false,
+          errorCategory: 'TOKEN_ERROR',
+          code: 'INVALID_FIREBASE_TOKEN',
           message: tokenCheck.error || 'Không thể xác thực Firebase ID Token trên máy chủ.'
         });
         return;
@@ -2057,11 +2558,42 @@ async function startServer() {
     }
 
     const configuredFirstAdminUid = getConfiguredFirstAdminUid();
+    const adminStatus = getFirebaseAdminStatus();
     const accounts = loadServerAccounts();
 
+    // Nếu UID đã xác thực trên máy chủ trùng khớp với process.env.FIRST_ADMIN_UID:
+    // Tự động đồng bộ custom claim admin=true và hồ sơ /admins/{uid} qua Firebase Admin SDK nếu đã cấu hình Service Account
+    if (configuredFirstAdminUid && verifiedUid === configuredFirstAdminUid && !isAdminClaim) {
+      if (adminStatus.serviceAccountConfigured) {
+        try {
+          await executeServerAdminBootstrap(configuredFirstAdminUid);
+          isAdminClaim = true;
+        } catch (bootErr: any) {
+          console.warn(
+            '[FirebaseAdmin] Cảnh báo khi tự động đồng bộ custom claim cho FIRST_ADMIN_UID:',
+            bootErr?.message || bootErr
+          );
+          // Vẫn cấp phiên Admin phía máy chủ vì UID trong Firebase ID Token đã được xác minh khớp FIRST_ADMIN_UID
+          isAdminClaim = true;
+        }
+      } else {
+        res.status(503).json({
+          matched: false,
+          errorCategory: 'CONFIG_ERROR',
+          code: 'ADMIN_SDK_NOT_CONFIGURED',
+          firebaseUid: verifiedUid,
+          email: verifiedEmail,
+          message: adminStatus.initializationError
+            ? `Tài khoản của bạn (UID: ${verifiedUid}) đã khớp với FIRST_ADMIN_UID, nhưng biến môi trường FIREBASE_SERVICE_ACCOUNT_JSON trên máy chủ gặp lỗi định dạng: ${adminStatus.initializationError}`
+            : `Tài khoản của bạn (UID: ${verifiedUid}) đã khớp với FIRST_ADMIN_UID, nhưng máy chủ chưa đọc được biến môi trường FIREBASE_SERVICE_ACCOUNT_JSON để khởi tạo Firebase Admin SDK.`
+        });
+        return;
+      }
+    }
+
     // 1. Kiểm tra quyền Quản trị viên:
-    //    Bắt buộc phải có custom claim `admin === true` trên Firebase ID Token
-    //    (và nếu máy chủ có cấu hình FIRST_ADMIN_UID thì UID phải trùng khớp với FIRST_ADMIN_UID).
+    //    Bắt buộc phải có custom claim `admin === true` (hoặc vừa được đồng bộ vì khớp FIRST_ADMIN_UID)
+    //    và nếu máy chủ có cấu hình FIRST_ADMIN_UID thì UID phải trùng khớp với FIRST_ADMIN_UID.
     const isAuthorizedAdmin =
       isAdminClaim && (!configuredFirstAdminUid || verifiedUid === configuredFirstAdminUid);
 
@@ -2106,25 +2638,13 @@ async function startServer() {
         role: 'admin'
       });
 
-      res.json({
+      res.status(200).json({
         matched: true,
         firebaseUid: verifiedUid,
         isAdminClaim: true,
         user: sanitizeAccountForClient(adminUser),
         sessionToken,
         adminApprovalSignature: generateAdminApprovalSignature(verifiedUid)
-      });
-      return;
-    }
-
-    // Nếu UID trùng với FIRST_ADMIN_UID nhưng token chưa có custom claim admin=true
-    if (configuredFirstAdminUid && verifiedUid === configuredFirstAdminUid && !isAdminClaim) {
-      res.status(403).json({
-        matched: false,
-        code: 'FIRST_ADMIN_CLAIM_MISSING',
-        firebaseUid: verifiedUid,
-        email: verifiedEmail,
-        message: `Tài khoản Firebase của bạn (UID: ${verifiedUid}) trùng khớp với FIRST_ADMIN_UID nhưng chưa có custom claim "admin=true" trong ID Token. Hãy chạy lệnh "npm run bootstrap:admin" trên máy chủ (hoặc bấm nút Khởi tạo Claim Admin bên dưới nếu đã cấu hình Service Account), sau đó đăng nhập lại để nhận quyền Quản trị viên.`
       });
       return;
     }
@@ -2138,11 +2658,25 @@ async function startServer() {
     );
 
     if (!user) {
+      if (!configuredFirstAdminUid) {
+        res.status(403).json({
+          matched: false,
+          errorCategory: 'CONFIG_ERROR',
+          code: 'FIRST_ADMIN_UID_NOT_CONFIGURED',
+          firebaseUid: verifiedUid,
+          email: verifiedEmail,
+          message: `Tài khoản Firebase (${verifiedEmail || verifiedUid}, UID: ${verifiedUid}) chưa có trong danh sách Giáo viên/Học sinh, và máy chủ hiện chưa đọc được biến môi trường FIRST_ADMIN_UID.`
+        });
+        return;
+      }
+
       res.status(403).json({
         matched: false,
+        errorCategory: 'PERMISSION_ERROR',
+        code: 'ADMIN_UID_MISMATCH',
         firebaseUid: verifiedUid,
         email: verifiedEmail,
-        message: `Tài khoản Firebase (${verifiedEmail || verifiedUid}) chưa được cấp quyền trong hệ thống. UID của bạn là: ${verifiedUid}. Nếu bạn là Quản trị viên triển khai hệ thống, hãy cấu hình FIRST_ADMIN_UID="${verifiedUid}" trong tệp .env và chạy "npm run bootstrap:admin". Nếu bạn là Giáo viên, vui lòng gửi Yêu cầu tham gia Giáo viên (Xác minh OTP).`
+        message: `Từ chối quyền truy cập (403): Tài khoản Firebase (${verifiedEmail || verifiedUid}, UID: ${verifiedUid}) không khớp với FIRST_ADMIN_UID đã cấu hình trên máy chủ và chưa có hồ sơ Giáo viên/Học sinh được duyệt.`
       });
       return;
     }
@@ -3772,14 +4306,40 @@ ${studentEssay}`;
   });
 
   // Catch-all for unknown /api/* routes so they never fall through to Vite SPA HTML
-  app.use('/api', (_req, res) => {
-    res.status(404).json({ error: 'Không tìm thấy đường dẫn API yêu cầu (404).' });
+  app.use('/api', (req, res) => {
+    res.status(404).json({
+      success: false,
+      errorCategory: 'ENDPOINT_ERROR',
+      error: `Không tìm thấy đường dẫn API yêu cầu: ${req.method} ${req.originalUrl} (404).`
+    });
   });
+
+  // Global JSON error handler for /api/* routes so API never returns empty body or HTML on error
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('[API Error]:', err);
+    if (!res.headersSent) {
+      res.status(err?.status || 500).json({
+        success: false,
+        errorCategory: 'ENDPOINT_ERROR',
+        error: err?.message || 'Lỗi xử lý nội bộ trên máy chủ API.'
+      });
+    }
+  });
+
+  return app;
+}
+
+export const apiApp = createApiApp();
+export default apiApp;
+
+async function startServer() {
+  const app = apiApp;
 
   // ==========================================================================
   // 6. Vite Middleware (Dev) or Static Assets (Prod)
   // ==========================================================================
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'
@@ -3812,7 +4372,14 @@ ${studentEssay}`;
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+const isMainServerEntry = Boolean(
+  process.argv[1] && /server\.(ts|js|mjs|cjs)$/i.test(process.argv[1])
+);
+
+if (!IS_VERCEL_RUNTIME && isMainServerEntry) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
+
