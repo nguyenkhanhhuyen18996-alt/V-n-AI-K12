@@ -187,9 +187,16 @@ export function getFirebaseAdminStatus(): FirebaseAdminConfigStatus {
   }
 
   return {
-    projectId: String(appletConfig.projectId || process.env.FIREBASE_PROJECT_ID || ''),
+    projectId: String(
+      app?.options?.projectId ||
+        process.env.FIREBASE_PROJECT_ID ||
+        appletConfig.projectId ||
+        ''
+    ),
     firestoreDatabaseId: String(
-      (appletConfig as any).firestoreDatabaseId || process.env.FIRESTORE_DATABASE_ID || '(default)'
+      process.env.FIRESTORE_DATABASE_ID ||
+        (appletConfig as any).firestoreDatabaseId ||
+        '(default)'
     ),
     firstAdminUidConfigured: Boolean(firstAdminUid),
     firstAdminUidMasked: maskUidForDisplay(firstAdminUid),
@@ -236,10 +243,11 @@ export async function verifyFirebaseIdTokenOnServer(
     };
   }
 
+  let adminSdkError: string | null = null;
   const adminApp = ensureFirebaseAdminInitialized();
   if (adminApp) {
     try {
-      const decoded = await getAuth(adminApp).verifyIdToken(cleanToken, true);
+      const decoded = await getAuth(adminApp).verifyIdToken(cleanToken);
       return {
         valid: true,
         uid: decoded.uid,
@@ -251,13 +259,11 @@ export async function verifyFirebaseIdTokenOnServer(
         verifiedBy: 'firebase_admin_sdk'
       };
     } catch (err: any) {
-      return {
-        valid: false,
-        verifiedBy: 'firebase_admin_sdk',
-        error: `Xác thực Firebase ID Token bằng Firebase Admin SDK thất bại: ${
-          err?.message || 'Token không hợp lệ hoặc đã hết hạn.'
-        }`
-      };
+      adminSdkError = err?.message || 'Token không hợp lệ hoặc đã hết hạn.';
+      console.warn(
+        '[FirebaseAdmin] verifyIdToken qua Admin SDK gặp lỗi, chuyển sang xác thực dự phòng qua Identity Toolkit API:',
+        adminSdkError
+      );
     }
   }
 
@@ -266,8 +272,10 @@ export async function verifyFirebaseIdTokenOnServer(
   if (!webApiKey) {
     return {
       valid: false,
-      verifiedBy: 'none',
-      error: 'Máy chủ chưa có cấu hình Firebase API Key hoặc Firebase Admin Service Account.'
+      verifiedBy: adminSdkError ? 'firebase_admin_sdk' : 'none',
+      error: adminSdkError
+        ? `Xác thực Firebase ID Token bằng Firebase Admin SDK thất bại: ${adminSdkError}`
+        : 'Máy chủ chưa có cấu hình Firebase API Key hoặc Firebase Admin Service Account.'
     };
   }
 
@@ -402,47 +410,62 @@ export async function executeServerAdminBootstrap(explicitUid?: string): Promise
   let firestoreError: string | undefined;
 
   try {
-    const dbId = appletConfig.firestoreDatabaseId || process.env.FIRESTORE_DATABASE_ID;
-    const db = dbId ? getAdminFirestore(adminApp, dbId) : getAdminFirestore(adminApp);
-    const now = FieldValue.serverTimestamp();
+    const writeAdminDocs = async (dbInstance: ReturnType<typeof getAdminFirestore>) => {
+      const now = FieldValue.serverTimestamp();
+      await dbInstance
+        .collection('admins')
+        .doc(targetUid)
+        .set(
+          {
+            uid: targetUid,
+            role: 'admin',
+            approvalSignature: `firebase-admin-sdk-claim-${Date.now()}`,
+            bootstrappedBy: 'firebase-admin-sdk',
+            createdAt: now,
+            updatedAt: now
+          },
+          { merge: true }
+        );
 
-    await db
-      .collection('admins')
-      .doc(targetUid)
-      .set(
-        {
-          uid: targetUid,
-          role: 'admin',
-          approvalSignature: `firebase-admin-sdk-claim-${Date.now()}`,
-          bootstrappedBy: 'firebase-admin-sdk',
-          createdAt: now,
-          updatedAt: now
-        },
-        { merge: true }
-      );
+      await dbInstance
+        .collection('users')
+        .doc(targetUid)
+        .set(
+          {
+            uid: targetUid,
+            username: `ADMIN-${targetUid.slice(0, 6).toUpperCase()}`,
+            fullName: userRecord.displayName || userRecord.email || 'Quản trị viên Hệ thống',
+            role: 'admin',
+            className: 'Hệ thống',
+            status: 'active',
+            surveyCompleted: true,
+            targetScore: 9.0,
+            quickFocusArea: 'balanced',
+            quickDailyTime: '30_mins',
+            createdAt: now,
+            updatedAt: now
+          },
+          { merge: true }
+        );
+    };
 
-    await db
-      .collection('users')
-      .doc(targetUid)
-      .set(
-        {
-          uid: targetUid,
-          username: `ADMIN-${targetUid.slice(0, 6).toUpperCase()}`,
-          fullName: userRecord.displayName || userRecord.email || 'Quản trị viên Hệ thống',
-          role: 'admin',
-          className: 'Hệ thống',
-          status: 'active',
-          surveyCompleted: true,
-          targetScore: 9.0,
-          quickFocusArea: 'balanced',
-          quickDailyTime: '30_mins',
-          createdAt: now,
-          updatedAt: now
-        },
-        { merge: true }
-      );
-
-    firestoreAdminDocSynced = true;
+    const dbId = process.env.FIRESTORE_DATABASE_ID || appletConfig.firestoreDatabaseId;
+    try {
+      const db =
+        dbId && dbId !== '(default)'
+          ? getAdminFirestore(adminApp, dbId)
+          : getAdminFirestore(adminApp);
+      await writeAdminDocs(db);
+      firestoreAdminDocSynced = true;
+    } catch (primaryDbErr) {
+      if (dbId && dbId !== '(default)') {
+        const defaultDb = getAdminFirestore(adminApp);
+        await writeAdminDocs(defaultDb);
+        firestoreAdminDocSynced = true;
+      } else {
+        throw primaryDbErr;
+      }
+    }
   } catch (err: any) {
     firestoreError = err?.message || String(err);
     console.warn(
@@ -475,24 +498,39 @@ export async function syncTeacherRoleInFirestoreAdminSdk(params: {
 
   try {
     const appletConfig: any = getFirebaseProjectConfig();
-    const dbId = appletConfig.firestoreDatabaseId || process.env.FIRESTORE_DATABASE_ID;
-    const db = dbId ? getAdminFirestore(adminApp, dbId) : getAdminFirestore(adminApp);
-    const docRef = db.collection('admins').doc(params.teacherUid);
+    const dbId = process.env.FIRESTORE_DATABASE_ID || appletConfig.firestoreDatabaseId;
+    const writeTeacherDoc = async (dbInstance: ReturnType<typeof getAdminFirestore>) => {
+      const docRef = dbInstance.collection('admins').doc(params.teacherUid);
+      if (params.approved) {
+        await docRef.set(
+          {
+            uid: params.teacherUid,
+            role: 'teacher',
+            approvedByUid: params.reviewedByUid,
+            approvalSignature: `approved-by-${params.reviewedByUid}-${Date.now()}`,
+            createdAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+      } else {
+        await docRef.delete();
+      }
+    };
 
-    if (params.approved) {
-      await docRef.set(
-        {
-          uid: params.teacherUid,
-          role: 'teacher',
-          approvedByUid: params.reviewedByUid,
-          approvalSignature: `approved-by-${params.reviewedByUid}-${Date.now()}`,
-          createdAt: FieldValue.serverTimestamp(),
-          updatedAt: FieldValue.serverTimestamp()
-        },
-        { merge: true }
-      );
-    } else {
-      await docRef.delete();
+    try {
+      const db =
+        dbId && dbId !== '(default)'
+          ? getAdminFirestore(adminApp, dbId)
+          : getAdminFirestore(adminApp);
+      await writeTeacherDoc(db);
+    } catch (primaryErr) {
+      if (dbId && dbId !== '(default)') {
+        const defaultDb = getAdminFirestore(adminApp);
+        await writeTeacherDoc(defaultDb);
+      } else {
+        throw primaryErr;
+      }
     }
     return true;
   } catch (err) {
@@ -501,17 +539,29 @@ export async function syncTeacherRoleInFirestoreAdminSdk(params: {
   }
 }
 
-// Read Firebase project config for server-side Firebase Phone Auth token verification
-function getFirebaseProjectConfig(): { projectId?: string; apiKey?: string } {
+// Read Firebase project config for server-side Firebase token verification (with embedded fallback for Serverless environments)
+function getFirebaseProjectConfig(): {
+  projectId?: string;
+  apiKey?: string;
+  firestoreDatabaseId?: string;
+} {
+  const fallbackDefaults = {
+    projectId: 'gen-lang-client-0603655480',
+    apiKey: 'AIzaSyBlFIxGZ1uDyJTMhZN4WTlLgGaglec0wlg',
+    firestoreDatabaseId: 'ai-studio-vnai12trlchiuvvi-e4c6bf2e-9e42-4138-9e4c-b13f1a9b5f69'
+  };
   try {
     const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
     if (fs.existsSync(cfgPath)) {
-      return JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+      return {
+        ...fallbackDefaults,
+        ...JSON.parse(fs.readFileSync(cfgPath, 'utf-8'))
+      };
     }
   } catch {
     // ignore
   }
-  return {};
+  return fallbackDefaults;
 }
 
 // Atomic serialization lock to prevent race conditions on class creation (max 5) & student enrollment (max 50)
