@@ -58,8 +58,17 @@ function withQuotaLock<T>(task: () => Promise<T> | T): Promise<T> {
 }
 
 // Initialize Server-Side Gemini Client
+function getResolvedGeminiApiKey(): string {
+  return (
+    process.env.GEMINI_API_KEY ||
+    process.env.GEMINI_API_kEY ||
+    process.env.API_KEY ||
+    ''
+  ).trim();
+}
+
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = getResolvedGeminiApiKey();
   if (!apiKey) {
     throw new Error('Máy chủ chưa được cấu hình GEMINI_API_KEY.');
   }
@@ -919,7 +928,7 @@ async function startServer() {
     );
     res.json({
       status: 'ok',
-      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      geminiConfigured: Boolean(getResolvedGeminiApiKey()),
       emailProviderStatus: getEmailProviderStatus(),
       firebaseAdminStatus: getFirebaseAdminStatus(),
       hasAdminAccount,
