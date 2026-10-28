@@ -8,7 +8,6 @@ import nodemailer from 'nodemailer';
 import { GoogleGenAI, Type } from '@google/genai';
 import { initializeApp, getApps, cert, type App } from 'firebase-admin/app';
 import { getAuth, type UserRecord } from 'firebase-admin/auth';
-import { getFirestore as getAdminFirestore, FieldValue } from 'firebase-admin/firestore';
 
 const PORT = Number(process.env.PORT) || 3000;
 const IS_VERCEL_RUNTIME = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
@@ -34,7 +33,14 @@ try {
 
 const SESSION_SECRET =
   process.env.SESSION_SECRET ||
-  crypto.createHash('sha256').update(`${process.cwd()}:vanai12_hmac_secret_v2`).digest('hex');
+  crypto
+    .createHash('sha256')
+    .update(
+      `${process.env.FIRST_ADMIN_UID || ''}:${
+        process.env.FIREBASE_SERVICE_ACCOUNT_JSON || ''
+      }:vanai12_hmac_secret_v2`
+    )
+    .digest('hex');
 
 // ============================================================================
 // SERVER-SIDE FIREBASE ADMIN SDK SINGLETON & TOKEN / CLAIM VERIFICATION
@@ -107,22 +113,43 @@ function parseServiceAccountJsonEnv(rawInput: string): Record<string, any> {
   return parsed;
 }
 
+function validateServiceAccountKeyWithCrypto(parsed: Record<string, any>): void {
+  if (
+    !parsed ||
+    typeof parsed.client_email !== 'string' ||
+    !parsed.client_email.includes('@') ||
+    typeof parsed.private_key !== 'string' ||
+    !parsed.private_key.includes('PRIVATE KEY')
+  ) {
+    throw new Error(
+      'FIREBASE_SERVICE_ACCOUNT_JSON thiếu trường client_email hoặc private_key hợp lệ.'
+    );
+  }
+  crypto.createPrivateKey(parsed.private_key);
+}
+
 export function ensureFirebaseAdminInitialized(): App | null {
   if (cachedAdminApp) {
     return cachedAdminApp;
   }
 
-  const existingApps = getApps();
-  if (existingApps.length > 0 && existingApps[0]) {
-    cachedAdminApp = existingApps[0];
-    if (detectedCredentialSource === 'none') {
-      detectedCredentialSource = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-        ? 'FIREBASE_SERVICE_ACCOUNT_JSON'
-        : process.env.GOOGLE_APPLICATION_CREDENTIALS
-        ? 'GOOGLE_APPLICATION_CREDENTIALS'
-        : 'none';
+  try {
+    if (typeof getApps === 'function') {
+      const existingApps = getApps();
+      if (existingApps.length > 0 && existingApps[0]) {
+        cachedAdminApp = existingApps[0];
+        if (detectedCredentialSource === 'none') {
+          detectedCredentialSource = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+            ? 'FIREBASE_SERVICE_ACCOUNT_JSON'
+            : process.env.GOOGLE_APPLICATION_CREDENTIALS
+            ? 'GOOGLE_APPLICATION_CREDENTIALS'
+            : 'none';
+        }
+        return cachedAdminApp;
+      }
     }
-    return cachedAdminApp;
+  } catch {
+    // ignore and proceed to credential initialization
   }
 
   const appletConfig = getFirebaseProjectConfig();
@@ -132,12 +159,28 @@ export function ensureFirebaseAdminInitialized(): App | null {
   try {
     if (serviceAccountJsonRaw) {
       const parsed = parseServiceAccountJsonEnv(serviceAccountJsonRaw);
+      validateServiceAccountKeyWithCrypto(parsed);
       detectedCredentialSource = 'FIREBASE_SERVICE_ACCOUNT_JSON';
       adminInitError = null;
-      cachedAdminApp = initializeApp({
-        credential: cert(parsed),
-        projectId: parsed.project_id || appletConfig.projectId
-      });
+      if (typeof initializeApp === 'function' && typeof cert === 'function') {
+        try {
+          cachedAdminApp = initializeApp({
+            credential: cert(parsed),
+            projectId: parsed.project_id || appletConfig.projectId
+          });
+          return cachedAdminApp;
+        } catch (sdkErr: any) {
+          console.warn(
+            '[FirebaseAdmin] Khởi tạo qua firebase-admin/app gặp cảnh báo, dùng chế độ Service Account REST trực tiếp:',
+            sdkErr?.message || sdkErr
+          );
+        }
+      }
+      cachedAdminApp = {
+        name: '[DEFAULT]',
+        options: { projectId: parsed.project_id || appletConfig.projectId },
+        __isRestFallback: true
+      } as any;
       return cachedAdminApp;
     }
 
@@ -150,12 +193,28 @@ export function ensureFirebaseAdminInitialized(): App | null {
         return null;
       }
       const parsed = parseServiceAccountJsonEnv(fs.readFileSync(resolvedPath, 'utf-8'));
+      validateServiceAccountKeyWithCrypto(parsed);
       detectedCredentialSource = 'GOOGLE_APPLICATION_CREDENTIALS';
       adminInitError = null;
-      cachedAdminApp = initializeApp({
-        credential: cert(parsed),
-        projectId: parsed.project_id || appletConfig.projectId
-      });
+      if (typeof initializeApp === 'function' && typeof cert === 'function') {
+        try {
+          cachedAdminApp = initializeApp({
+            credential: cert(parsed),
+            projectId: parsed.project_id || appletConfig.projectId
+          });
+          return cachedAdminApp;
+        } catch (sdkErr: any) {
+          console.warn(
+            '[FirebaseAdmin] Khởi tạo qua firebase-admin/app gặp cảnh báo, dùng chế độ Service Account REST trực tiếp:',
+            sdkErr?.message || sdkErr
+          );
+        }
+      }
+      cachedAdminApp = {
+        name: '[DEFAULT]',
+        options: { projectId: parsed.project_id || appletConfig.projectId },
+        __isRestFallback: true
+      } as any;
       return cachedAdminApp;
     }
 
@@ -246,7 +305,7 @@ export async function verifyFirebaseIdTokenOnServer(
 
   let adminSdkError: string | null = null;
   const adminApp = ensureFirebaseAdminInitialized();
-  if (adminApp) {
+  if (adminApp && !(adminApp as any).__isRestFallback && typeof getAuth === 'function') {
     try {
       const decoded = await getAuth(adminApp).verifyIdToken(cleanToken);
       return {
@@ -268,8 +327,73 @@ export async function verifyFirebaseIdTokenOnServer(
     }
   }
 
+  // Dự phòng 1: Xác thực qua Google Identity Toolkit bằng OAuth2 Access Token của Service Account
+  try {
+    const parsedSa = getParsedServiceAccountFromEnv();
+    if (parsedSa) {
+      const accessToken = await getServiceAccountAccessToken(parsedSa);
+      const saProjectId =
+        parsedSa.project_id ||
+        process.env.FIREBASE_PROJECT_ID ||
+        getFirebaseProjectConfig().projectId;
+      const saVerifyRes = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/projects/${encodeURIComponent(
+          String(saProjectId)
+        )}/accounts:lookup`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ idToken: cleanToken })
+        }
+      );
+      if (saVerifyRes.ok) {
+        const saLookupData: any = await saVerifyRes.json();
+        const fbUser = saLookupData?.users?.[0];
+        if (fbUser && fbUser.localId && !fbUser.disabled) {
+          const jwtPayload = decodeJwtPayloadUnsafe(cleanToken) || {};
+          let customAttrs: Record<string, any> = {};
+          if (typeof fbUser.customAttributes === 'string') {
+            try {
+              customAttrs = JSON.parse(fbUser.customAttributes);
+            } catch {
+              customAttrs = {};
+            }
+          }
+          const isAdminClaim =
+            jwtPayload.admin === true ||
+            jwtPayload.role === 'admin' ||
+            customAttrs.admin === true ||
+            customAttrs.role === 'admin';
+          return {
+            valid: true,
+            uid: String(fbUser.localId),
+            email: fbUser.email ? String(fbUser.email).toLowerCase() : jwtPayload.email,
+            emailVerified: Boolean(fbUser.emailVerified),
+            displayName: fbUser.displayName || jwtPayload.name,
+            phoneNumber: fbUser.phoneNumber || jwtPayload.phone_number,
+            isAdminClaim,
+            verifiedBy: 'firebase_admin_sdk'
+          };
+        }
+      }
+    }
+  } catch (saRestErr: any) {
+    console.warn(
+      '[FirebaseAdmin] Xác thực token qua Service Account OAuth2 gặp cảnh báo, thử tiếp Web API Key:',
+      saRestErr?.message || saRestErr
+    );
+  }
+
   const appletConfig = getFirebaseProjectConfig();
-  const webApiKey = String(appletConfig.apiKey || process.env.FIREBASE_WEB_API_KEY || '').trim();
+  const webApiKey = String(
+    process.env.FIREBASE_WEB_API_KEY ||
+      process.env.VITE_FIREBASE_API_KEY ||
+      appletConfig.apiKey ||
+      ''
+  ).trim();
   if (!webApiKey) {
     return {
       valid: false,
@@ -354,6 +478,70 @@ export async function verifyFirebaseIdTokenOnServer(
   }
 }
 
+function getParsedServiceAccountFromEnv(): Record<string, any> | null {
+  const serviceAccountJsonRaw = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+  const googleCredsPath = String(process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+  if (serviceAccountJsonRaw) {
+    return parseServiceAccountJsonEnv(serviceAccountJsonRaw);
+  }
+  if (googleCredsPath) {
+    const resolvedPath = path.isAbsolute(googleCredsPath)
+      ? googleCredsPath
+      : path.resolve(process.cwd(), googleCredsPath);
+    if (fs.existsSync(resolvedPath)) {
+      return parseServiceAccountJsonEnv(fs.readFileSync(resolvedPath, 'utf-8'));
+    }
+  }
+  return null;
+}
+
+async function getServiceAccountAccessToken(sa: Record<string, any>): Promise<string> {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const headerB64 = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString(
+    'base64url'
+  );
+  const tokenUri = sa.token_uri || 'https://oauth2.googleapis.com/token';
+  const payloadB64 = Buffer.from(
+    JSON.stringify({
+      iss: sa.client_email,
+      sub: sa.client_email,
+      aud: tokenUri,
+      iat: nowSec,
+      exp: nowSec + 3600,
+      scope: [
+        'https://www.googleapis.com/auth/identitytoolkit',
+        'https://www.googleapis.com/auth/firebase',
+        'https://www.googleapis.com/auth/datastore',
+        'https://www.googleapis.com/auth/cloud-platform'
+      ].join(' ')
+    })
+  ).toString('base64url');
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(signingInput);
+  signer.end();
+  const signatureB64 = signer.sign(sa.private_key, 'base64url');
+  const assertion = `${signingInput}.${signatureB64}`;
+
+  const tokenRes = await fetch(tokenUri, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion
+    }).toString()
+  });
+
+  if (!tokenRes.ok) {
+    const errText = await tokenRes.text().catch(() => '');
+    throw new Error(
+      `Không lấy được Google OAuth2 Access Token từ Service Account (${tokenRes.status}): ${errText}`
+    );
+  }
+  const tokenData: any = await tokenRes.json();
+  return String(tokenData.access_token || '');
+}
+
 export async function executeServerAdminBootstrap(explicitUid?: string): Promise<{
   success: boolean;
   uid: string;
@@ -377,7 +565,15 @@ export async function executeServerAdminBootstrap(explicitUid?: string): Promise
   }
 
   const adminApp = ensureFirebaseAdminInitialized();
-  if (!adminApp) {
+  const parsedSa = (() => {
+    try {
+      return getParsedServiceAccountFromEnv();
+    } catch {
+      return null;
+    }
+  })();
+
+  if (!adminApp && !parsedSa) {
     const status = getFirebaseAdminStatus();
     throw new Error(
       status.initializationError ||
@@ -387,31 +583,105 @@ export async function executeServerAdminBootstrap(explicitUid?: string): Promise
     );
   }
 
-  const adminAuth = getAuth(adminApp);
-  let userRecord: UserRecord;
-  try {
-    userRecord = await adminAuth.getUser(targetUid);
-  } catch (err: any) {
-    throw new Error(
-      `Không tìm thấy tài khoản có UID "${targetUid}" trong Firebase Authentication của dự án (${
-        err?.message || 'user-not-found'
-      }).`
-    );
+  let userEmail: string | undefined;
+  let userDisplayName: string | undefined;
+  let customClaimSet = false;
+
+  if (adminApp) {
+    try {
+      const adminAuth = getAuth(adminApp);
+      const userRecord: UserRecord = await adminAuth.getUser(targetUid);
+      userEmail = userRecord.email || undefined;
+      userDisplayName = userRecord.displayName || undefined;
+      const existingClaims = userRecord.customClaims || {};
+      await adminAuth.setCustomUserClaims(targetUid, {
+        ...existingClaims,
+        admin: true,
+        role: 'admin'
+      });
+      customClaimSet = true;
+    } catch (adminSdkErr: any) {
+      if (!parsedSa) {
+        throw new Error(
+          `Không thể cấp custom claim qua Firebase Admin SDK cho UID "${targetUid}": ${
+            adminSdkErr?.message || 'user-not-found'
+          }`
+        );
+      }
+      console.warn(
+        '[FirebaseAdmin] Chuyển sang Google Identity Toolkit Admin REST API để cấp custom claim:',
+        adminSdkErr?.message || adminSdkErr
+      );
+    }
   }
 
-  const existingClaims = userRecord.customClaims || {};
-  await adminAuth.setCustomUserClaims(targetUid, {
-    ...existingClaims,
-    admin: true,
-    role: 'admin'
-  });
+  if (!customClaimSet && parsedSa) {
+    const accessToken = await getServiceAccountAccessToken(parsedSa);
+    const projectId =
+      parsedSa.project_id ||
+      process.env.FIREBASE_PROJECT_ID ||
+      getFirebaseProjectConfig().projectId;
+
+    const lookupRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/projects/${encodeURIComponent(
+        String(projectId)
+      )}/accounts:lookup`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ localId: [targetUid] })
+      }
+    );
+    if (lookupRes.ok) {
+      const lookupData: any = await lookupRes.json().catch(() => ({}));
+      const fbUser = lookupData?.users?.[0];
+      if (fbUser) {
+        userEmail = fbUser.email || undefined;
+        userDisplayName = fbUser.displayName || undefined;
+      }
+    }
+
+    const updateRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/projects/${encodeURIComponent(
+        String(projectId)
+      )}/accounts:update`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          localId: targetUid,
+          customAttributes: JSON.stringify({ admin: true, role: 'admin' })
+        })
+      }
+    );
+
+    if (!updateRes.ok) {
+      const errText = await updateRes.text().catch(() => '');
+      throw new Error(
+        `Không thể cấp custom claim admin=true cho UID "${targetUid}" (${updateRes.status}): ${errText}`
+      );
+    }
+    customClaimSet = true;
+  }
 
   const appletConfig: any = getFirebaseProjectConfig();
   let firestoreAdminDocSynced = false;
   let firestoreError: string | undefined;
 
   try {
-    const writeAdminDocs = async (dbInstance: ReturnType<typeof getAdminFirestore>) => {
+    if (!adminApp) {
+      throw new Error('Admin App instance not initialized for Firestore SDK');
+    }
+    const { getFirestore: getAdminFirestore, FieldValue } = await import(
+      'firebase-admin/firestore'
+    );
+    const writeAdminDocs = async (dbInstance: any) => {
       const now = FieldValue.serverTimestamp();
       await dbInstance
         .collection('admins')
@@ -435,7 +705,7 @@ export async function executeServerAdminBootstrap(explicitUid?: string): Promise
           {
             uid: targetUid,
             username: `ADMIN-${targetUid.slice(0, 6).toUpperCase()}`,
-            fullName: userRecord.displayName || userRecord.email || 'Quản trị viên Hệ thống',
+            fullName: userDisplayName || userEmail || 'Quản trị viên Hệ thống',
             role: 'admin',
             className: 'Hệ thống',
             status: 'active',
@@ -478,13 +748,13 @@ export async function executeServerAdminBootstrap(explicitUid?: string): Promise
   return {
     success: true,
     uid: targetUid,
-    email: userRecord.email || undefined,
-    displayName: userRecord.displayName || undefined,
-    customClaimSet: true,
+    email: userEmail,
+    displayName: userDisplayName,
+    customClaimSet,
     firestoreAdminDocSynced,
     firestoreError,
     message: `Đã cấp custom claim { admin: true } trên Firebase Authentication cho UID "${targetUid}" (${
-      userRecord.email || 'không có email'
+      userEmail || 'không có email'
     }).`
   };
 }
@@ -498,9 +768,12 @@ export async function syncTeacherRoleInFirestoreAdminSdk(params: {
   if (!adminApp) return false;
 
   try {
+    const { getFirestore: getAdminFirestore, FieldValue } = await import(
+      'firebase-admin/firestore'
+    );
     const appletConfig: any = getFirebaseProjectConfig();
     const dbId = process.env.FIRESTORE_DATABASE_ID || appletConfig.firestoreDatabaseId;
-    const writeTeacherDoc = async (dbInstance: ReturnType<typeof getAdminFirestore>) => {
+    const writeTeacherDoc = async (dbInstance: any) => {
       const docRef = dbInstance.collection('admins').doc(params.teacherUid);
       if (params.approved) {
         await docRef.set(
@@ -1280,6 +1553,38 @@ async function verifyFirebasePhoneIdTokenOnServer(
   }
 }
 
+function resolveOrHydrateVerifiedSessionUser(
+  verified: SessionTokenPayload
+): StoredUserAccount | undefined {
+  const accounts = loadServerAccounts();
+  let dbUser = accounts.find((a) => a.id === verified.uid);
+  const configuredFirstAdminUid = getConfiguredFirstAdminUid();
+  if (
+    !dbUser &&
+    verified.role === 'admin' &&
+    (!configuredFirstAdminUid || verified.uid === configuredFirstAdminUid)
+  ) {
+    const now = new Date().toISOString();
+    const salt = generateSaltServer();
+    dbUser = {
+      id: verified.uid,
+      username: verified.username || `ADMIN-${verified.uid.slice(0, 6).toUpperCase()}`,
+      fullName: 'Quản trị viên Hệ thống',
+      role: 'admin',
+      isActivated: true,
+      passwordSalt: salt,
+      passwordHash: hashPasswordServer(crypto.randomBytes(24).toString('hex'), salt),
+      createdAt: now,
+      lastLoginAt: now,
+      status: 'active',
+      notes: 'Quản trị viên xác thực qua Firebase Auth (custom claim admin=true)'
+    };
+    accounts.unshift(dbUser);
+    saveServerAccounts(accounts);
+  }
+  return dbUser;
+}
+
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   const token = extractBearerToken(req);
   const verified = verifySessionToken(token);
@@ -1289,8 +1594,7 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
     });
     return;
   }
-  const accounts = loadServerAccounts();
-  const dbUser = accounts.find((a) => a.id === verified.uid);
+  const dbUser = resolveOrHydrateVerifiedSessionUser(verified);
   if (!dbUser || dbUser.status === 'locked') {
     res.status(403).json({
       error: 'Tài khoản không tồn tại hoặc đã bị khóa.'
@@ -1325,11 +1629,8 @@ function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
     });
     return;
   }
-  const accounts = loadServerAccounts();
-  const dbUser = accounts.find(
-    (a) => a.id === verified.uid && a.role === 'admin' && a.status === 'active'
-  );
-  if (!dbUser) {
+  const dbUser = resolveOrHydrateVerifiedSessionUser(verified);
+  if (!dbUser || dbUser.role !== 'admin' || dbUser.status !== 'active') {
     res.status(403).json({
       error: 'Từ chối truy cập (403): Tài khoản Quản trị viên không hợp lệ hoặc đã bị khóa.'
     });
@@ -1356,8 +1657,7 @@ function requireTeacherAuth(req: Request, res: Response, next: NextFunction) {
     return;
   }
 
-  const accounts = loadServerAccounts();
-  const dbUser = accounts.find((a) => a.id === verified.uid);
+  const dbUser = resolveOrHydrateVerifiedSessionUser(verified);
   if (!dbUser || dbUser.status !== 'active') {
     res.status(403).json({
       error: 'Từ chối truy cập (403): Tài khoản không hợp lệ hoặc đang bị tạm khóa.'

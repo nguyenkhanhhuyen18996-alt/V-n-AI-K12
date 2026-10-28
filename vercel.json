@@ -5,6 +5,18 @@
   "outputDirectory": "dist",
   "rewrites": [
     {
+      "source": "/api/auth/bootstrap-status",
+      "destination": "/api/auth/bootstrap-status"
+    },
+    {
+      "source": "/api/auth/google-match",
+      "destination": "/api/auth/google-match"
+    },
+    {
+      "source": "/api/auth/bootstrap-admin",
+      "destination": "/api/auth/bootstrap-admin"
+    },
+    {
       "source": "/api/:path*",
       "destination": "/api"
     },
