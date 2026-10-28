@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { RecaptchaVerifier } from 'firebase/auth';
 import {
   UserAccount,
   TeacherRegistrationRecord,
@@ -24,6 +25,8 @@ import {
   googleSignIn,
   getCurrentFirebaseIdToken,
   isFirebaseCloudConnected,
+  ensurePhoneRecaptchaVerifier,
+  cleanupPhoneRecaptchaVerifier,
   requestFirebasePhoneOtp,
   confirmFirebasePhoneOtpCode
 } from '../services/firebaseAuth';
@@ -110,6 +113,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [phoneOtpSent, setPhoneOtpSent] = useState(false);
   const [gmailOtpSent, setGmailOtpSent] = useState(false);
   const [lookupIdentifier, setLookupIdentifier] = useState('');
+  const [emailProviderStatus, setEmailProviderStatus] = useState<{
+    configured: boolean;
+    providerName: string;
+    missingEnvVars: string[];
+  } | null>(null);
+
+  // Quản lý vòng đời RecaptchaVerifier bằng ref (không tạo lại khi component render hay bấm nút)
+  const recaptchaContainerRef = useRef<HTMLDivElement | null>(null);
+  const recaptchaVerifierRef = useRef<RecaptchaVerifier | null>(null);
+  const recaptchaWidgetIdRef = useRef<number | null>(null);
+  const isOtpSubmittingRef = useRef<boolean>(false);
 
   // Form đổi mật khẩu
   const [oldPassword, setOldPassword] = useState('');
@@ -126,6 +140,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setStatusCheckState('loading');
     setStatusEndpointError(null);
     const status = await checkTeacherBootstrapStatus();
+    if (status.emailProviderStatus) {
+      setEmailProviderStatus(status.emailProviderStatus);
+    }
     if (status.endpointReachable && status.firebaseAdminStatus) {
       setServerAdminStatus(status.firebaseAdminStatus);
       setStatusCheckState('ready');
@@ -147,6 +164,48 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
     refreshServerConfigStatus();
   }, [isOpen]);
+
+  // Chỉ khởi tạo RecaptchaVerifier một lần sau khi phần tử reCAPTCHA đã có trên trang,
+  // và dọn dẹp đúng cách khi đóng form, đổi tab hoặc chuyển sang phương thức Gmail OTP.
+  const isPhoneOtpViewActive = Boolean(
+    isOpen &&
+      !currentUser &&
+      activeTab === 'teacher_register' &&
+      activeRegistration &&
+      !activeRegistration.isOwnershipVerified &&
+      verificationMethod === 'phone_otp'
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!isPhoneOtpViewActive) {
+      cleanupPhoneRecaptchaVerifier(
+        recaptchaContainerRef.current,
+        recaptchaVerifierRef,
+        recaptchaWidgetIdRef
+      );
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      if (cancelled || !recaptchaContainerRef.current) return;
+      ensurePhoneRecaptchaVerifier(
+        recaptchaContainerRef.current,
+        recaptchaVerifierRef,
+        recaptchaWidgetIdRef
+      ).catch(() => {});
+    }, 50);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      cleanupPhoneRecaptchaVerifier(
+        recaptchaContainerRef.current,
+        recaptchaVerifierRef,
+        recaptchaWidgetIdRef
+      );
+    };
+  }, [isPhoneOtpViewActive, activeRegistration?.id]);
 
   if (!isOpen) return null;
 
@@ -254,6 +313,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         password: teacherPassword,
         verificationMethod
       });
+      if (res. emailProviderStatus) {
+        setEmailProviderStatus(res.emailProviderStatus);
+      }
       if (res.success && res.registration) {
         setActiveRegistration(res.registration);
         setPhoneOtpSent(false);
@@ -270,28 +332,34 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
-  // Gửi mã OTP qua Firebase Phone Authentication
+  // Gửi mã OTP qua Firebase Phone Authentication (tái sử dụng verifier quản lý bằng ref)
   const handleSendPhoneOtp = async () => {
-    if (!activeRegistration) return;
+    if (!activeRegistration || isLoading || isOtpSubmittingRef.current) return;
+    isOtpSubmittingRef.current = true;
     setErrorMessage(null);
+    setErrorCategory(null);
     setSuccessMessage(null);
     setIsLoading(true);
     try {
-      const res = await requestFirebasePhoneOtp(
-        activeRegistration.phone,
-        'firebase-phone-recaptcha-container'
-      );
+      const res = await requestFirebasePhoneOtp(activeRegistration.phone, {
+        containerEl: recaptchaContainerRef.current,
+        verifierRef: recaptchaVerifierRef,
+        widgetIdRef: recaptchaWidgetIdRef
+      });
       if (res.sent) {
         setPhoneOtpSent(true);
         setSuccessMessage(
           `Đã gửi mã SMS OTP 6 chữ số qua Firebase Phone Auth đến số ${res.e164Phone}.`
         );
       } else {
-        setErrorMessage(res.error || 'Không thể gửi mã SMS OTP.');
+        setPhoneOtpSent(false);
+        setErrorMessage(res.error || 'Không thể gửi mã SMS OTP qua Firebase Phone Authentication.');
       }
     } catch (err: any) {
-      setErrorMessage(err.message || 'Lỗi gửi SMS OTP.');
+      setPhoneOtpSent(false);
+      setErrorMessage(err.message || 'Lỗi gửi SMS OTP qua Firebase Phone Authentication.');
     } finally {
+      isOtpSubmittingRef.current = false;
       setIsLoading(false);
     }
   };
@@ -299,8 +367,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   // Xác nhận mã SMS OTP và gửi token xác thực lên máy chủ
   const handleConfirmPhoneOtp = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeRegistration) return;
+    if (!activeRegistration || isLoading || isOtpSubmittingRef.current) return;
+    isOtpSubmittingRef.current = true;
     setErrorMessage(null);
+    setErrorCategory(null);
     setSuccessMessage(null);
     setIsLoading(true);
     try {
@@ -323,14 +393,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     } catch (err: any) {
       setErrorMessage(err.message || 'Lỗi xác minh OTP số điện thoại.');
     } finally {
+      isOtpSubmittingRef.current = false;
       setIsLoading(false);
     }
   };
 
   // Gửi mã xác minh đến Gmail qua dịch vụ phía máy chủ
   const handleSendGmailOtp = async () => {
-    if (!activeRegistration) return;
+    if (!activeRegistration || isLoading || isOtpSubmittingRef.current) return;
+    isOtpSubmittingRef.current = true;
     setErrorMessage(null);
+    setErrorCategory(null);
     setSuccessMessage(null);
     setIsLoading(true);
     try {
@@ -343,8 +416,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         setErrorMessage(res.message);
       }
     } catch (err: any) {
+      setGmailOtpSent(false);
       setErrorMessage(err.message || 'Lỗi kết nối dịch vụ gửi mã Gmail.');
     } finally {
+      isOtpSubmittingRef.current = false;
       setIsLoading(false);
     }
   };
@@ -352,8 +427,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   // Xác minh mã Gmail 6 số trên máy chủ
   const handleConfirmGmailOtp = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeRegistration) return;
+    if (!activeRegistration || isLoading || isOtpSubmittingRef.current) return;
+    isOtpSubmittingRef.current = true;
     setErrorMessage(null);
+    setErrorCategory(null);
     setSuccessMessage(null);
     setIsLoading(true);
     try {
@@ -368,18 +445,23 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     } catch (err: any) {
       setErrorMessage(err.message || 'Lỗi xác minh mã Gmail.');
     } finally {
+      isOtpSubmittingRef.current = false;
       setIsLoading(false);
     }
   };
 
   // Tra cứu trạng thái hồ sơ giáo viên
   const handleLookupRegistration = async () => {
-    if (!lookupIdentifier.trim()) return;
+    if (!lookupIdentifier.trim() || isLoading) return;
     setErrorMessage(null);
+    setErrorCategory(null);
     setSuccessMessage(null);
     setIsLoading(true);
     try {
       const res = await fetchTeacherRegistrationStatus(lookupIdentifier);
+      if (res.emailProviderStatus) {
+        setEmailProviderStatus(res.emailProviderStatus);
+      }
       if (res.found && res.registration) {
         setActiveRegistration(res.registration);
         setVerificationMethod(res.registration.verificationMethod);
@@ -712,9 +794,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             <div className="flex-1 font-medium leading-relaxed">{successMessage}</div>
           </div>
         )}
-
-        {/* Vùng chứa reCAPTCHA vô hình cho Firebase Phone Authentication */}
-        <div id="firebase-phone-recaptcha-container"></div>
 
         {/* Body content */}
         <div className="p-5 overflow-y-auto space-y-4">
@@ -1212,8 +1291,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                         <div className="flex gap-1.5">
                           <button
                             type="button"
-                            onClick={() => setVerificationMethod('phone_otp')}
-                            className={`px-2.5 py-1 rounded text-[11px] font-bold cursor-pointer ${
+                            disabled={isLoading}
+                            onClick={() => {
+                              setVerificationMethod('phone_otp');
+                              setErrorMessage(null);
+                              setSuccessMessage(null);
+                            }}
+                            className={`px-2.5 py-1 rounded text-[11px] font-bold cursor-pointer disabled:opacity-50 ${
                               verificationMethod === 'phone_otp'
                                 ? 'bg-blue-700 text-white'
                                 : 'bg-stone-100 text-stone-600'
@@ -1223,8 +1307,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                           </button>
                           <button
                             type="button"
-                            onClick={() => setVerificationMethod('gmail_otp')}
-                            className={`px-2.5 py-1 rounded text-[11px] font-bold cursor-pointer ${
+                            disabled={isLoading}
+                            onClick={() => {
+                              setVerificationMethod('gmail_otp');
+                              setErrorMessage(null);
+                              setSuccessMessage(null);
+                            }}
+                            className={`px-2.5 py-1 rounded text-[11px] font-bold cursor-pointer disabled:opacity-50 ${
                               verificationMethod === 'gmail_otp'
                                 ? 'bg-emerald-700 text-white'
                                 : 'bg-stone-100 text-stone-600'
@@ -1241,14 +1330,19 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                             Sử dụng <strong>Firebase Phone Authentication</strong> kèm reCAPTCHA chống lạm dụng để gửi mã SMS OTP thật đến số{' '}
                             <strong>{activeRegistration.phone}</strong>.
                           </p>
+                          {/* Vùng chứa reCAPTCHA quản lý bằng ref, chỉ gắn khi đang ở chế độ OTP Điện thoại */}
+                          <div
+                            ref={recaptchaContainerRef}
+                            id="firebase-phone-recaptcha-container"
+                          />
                           <button
                             type="button"
                             onClick={handleSendPhoneOtp}
                             disabled={isLoading}
-                            className="w-full py-2 px-3 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-bold cursor-pointer disabled:opacity-50"
+                            className="w-full py-2 px-3 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-bold cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             {isLoading
-                              ? 'Đang kết nối Firebase Phone Auth...'
+                              ? 'Đang gửi yêu cầu tới Firebase Phone Auth...'
                               : phoneOtpSent
                               ? 'Gửi lại mã SMS OTP'
                               : `Gửi mã OTP đến ${activeRegistration.phone}`}
@@ -1266,10 +1360,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                               />
                               <button
                                 type="submit"
-                                disabled={isLoading}
-                                className="w-full py-2 px-3 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold cursor-pointer"
+                                disabled={isLoading || otpInputCode.length !== 6}
+                                className="w-full py-2 px-3 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold cursor-pointer disabled:opacity-50"
                               >
-                                Xác nhận Mã SMS OTP
+                                {isLoading ? 'Đang xác minh...' : 'Xác nhận Mã SMS OTP'}
                               </button>
                             </form>
                           )}
@@ -1280,11 +1374,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                             Máy chủ sinh mã 6 chữ số bảo mật (lưu băm PBKDF2, không tạo ở trình duyệt) và gửi tới địa chỉ Gmail{' '}
                             <strong>{activeRegistration.gmail}</strong>.
                           </p>
+                          {emailProviderStatus && !emailProviderStatus.configured && (
+                            <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-950 leading-relaxed">
+                              <strong>Lưu ý cấu hình máy chủ:</strong> Dịch vụ gửi email phía máy chủ hiện chưa được cấu hình (
+                              <code>{emailProviderStatus.missingEnvVars.join(', ')}</code>). Nếu máy chủ chưa có cấu hình SMTP / Resend, vui lòng sử dụng phương thức <strong>OTP Điện thoại</strong> hoặc cấu hình biến môi trường SMTP trên máy chủ.
+                            </div>
+                          )}
                           <button
                             type="button"
                             onClick={handleSendGmailOtp}
                             disabled={isLoading}
-                            className="w-full py-2 px-3 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold cursor-pointer disabled:opacity-50"
+                            className="w-full py-2 px-3 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             {isLoading
                               ? 'Đang yêu cầu máy chủ gửi mã...'
@@ -1305,10 +1405,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                               />
                               <button
                                 type="submit"
-                                disabled={isLoading}
-                                className="w-full py-2 px-3 rounded-lg bg-[#0F172A] hover:bg-stone-800 text-white text-xs font-bold cursor-pointer"
+                                disabled={isLoading || otpInputCode.length !== 6}
+                                className="w-full py-2 px-3 rounded-lg bg-[#0F172A] hover:bg-stone-800 text-white text-xs font-bold cursor-pointer disabled:opacity-50"
                               >
-                                Xác minh Mã Gmail
+                                {isLoading ? 'Đang xác minh...' : 'Xác minh Mã Gmail'}
                               </button>
                             </form>
                           )}

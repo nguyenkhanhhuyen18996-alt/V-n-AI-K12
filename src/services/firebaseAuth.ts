@@ -46,11 +46,19 @@ export const db = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId)
 export const auth = getAuth(app);
 
 // ============================================================================
-// FIREBASE PHONE AUTHENTICATION (REAL SMS OTP + RECAPTCHA ANTI-ABUSE)
+// FIREBASE PHONE AUTHENTICATION (REAL SMS OTP + RECAPTCHA LIFECYCLE VIA REF)
 // ============================================================================
-let activeRecaptchaVerifier: RecaptchaVerifier | null = null;
+export interface PhoneRecaptchaLifecycleRefs {
+  containerEl: HTMLElement | null;
+  verifierRef: { current: RecaptchaVerifier | null };
+  widgetIdRef?: { current: number | null };
+}
+
+let fallbackRecaptchaVerifier: RecaptchaVerifier | null = null;
+let fallbackWidgetId: number | null = null;
 let activePhoneConfirmationResult: ConfirmationResult | null = null;
 let lastPhoneOtpRequestAt = 0;
+let isPhoneOtpDispatchInFlight = false;
 
 export function normalizePhoneE164Client(rawPhone: string): string {
   const digits = String(rawPhone || '').replace(/[\s.\-()]/g, '');
@@ -66,21 +74,174 @@ export function normalizePhoneE164Client(rawPhone: string): string {
   return digits.startsWith('+') ? digits : `+${digits}`;
 }
 
-export async function requestFirebasePhoneOtp(
-  rawPhone: string,
-  recaptchaContainerId: string
-): Promise<{ sent: boolean; e164Phone: string; error?: string }> {
-  // Client-side rate-limit guard (anti-abuse)
-  const now = Date.now();
-  if (now - lastPhoneOtpRequestAt < 15000) {
-    const waitSec = Math.ceil((15000 - (now - lastPhoneOtpRequestAt)) / 1000);
+/**
+ * Dọn dẹp triệt để RecaptchaVerifier hiện tại và giải phóng phần tử DOM
+ * khi đóng biểu mẫu, chuyển tab hoặc đổi phương thức xác minh.
+ */
+export function cleanupPhoneRecaptchaVerifier(
+  containerEl?: HTMLElement | null,
+  verifierRef?: { current: RecaptchaVerifier | null },
+  widgetIdRef?: { current: number | null }
+): void {
+  const targetVerifier = verifierRef ? verifierRef.current : fallbackRecaptchaVerifier;
+  if (targetVerifier) {
+    try {
+      targetVerifier.clear();
+    } catch {
+      // ignore cleanup errors on detached DOM nodes
+    }
+  }
+  if (verifierRef) {
+    verifierRef.current = null;
+  } else {
+    fallbackRecaptchaVerifier = null;
+  }
+  if (widgetIdRef) {
+    widgetIdRef.current = null;
+  } else {
+    fallbackWidgetId = null;
+  }
+  if (containerEl) {
+    try {
+      containerEl.innerHTML = '';
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * Chỉ khởi tạo RecaptchaVerifier một lần sau khi phần tử chứa đã có trên trang.
+ * Gắn verifier vào một nút DOM con mới bên trong container để tuyệt đối không bao giờ
+ * xảy ra lỗi "reCAPTCHA has already been rendered in this element".
+ */
+export async function ensurePhoneRecaptchaVerifier(
+  containerEl: HTMLElement | null,
+  verifierRef: { current: RecaptchaVerifier | null },
+  widgetIdRef?: { current: number | null }
+): Promise<{ verifier: RecaptchaVerifier | null; error?: string }> {
+  if (verifierRef.current) {
+    return { verifier: verifierRef.current };
+  }
+
+  if (!containerEl || !document.body.contains(containerEl)) {
     return {
-      sent: false,
-      e164Phone: normalizePhoneE164Client(rawPhone),
-      error: `Chống lạm dụng OTP: Vui lòng đợi ${waitSec} giây trước khi gửi lại mã SMS OTP.`
+      verifier: null,
+      error: 'Phần tử bảo mật reCAPTCHA chưa sẵn sàng trên trang. Vui lòng thử lại.'
     };
   }
 
+  try {
+    containerEl.innerHTML = '';
+    const mountNode = document.createElement('div');
+    mountNode.className = 'firebase-recaptcha-mount-node';
+    containerEl.appendChild(mountNode);
+
+    const verifier = new RecaptchaVerifier(auth, mountNode, {
+      size: 'invisible',
+      'expired-callback': () => {
+        const g = (window as any).grecaptcha;
+        const wId = widgetIdRef ? widgetIdRef.current : fallbackWidgetId;
+        if (g && typeof g.reset === 'function' && typeof wId === 'number') {
+          try {
+            g.reset(wId);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    });
+
+    const widgetId = await verifier.render();
+    verifierRef.current = verifier;
+    if (widgetIdRef) {
+      widgetIdRef.current = typeof widgetId === 'number' ? widgetId : null;
+    } else {
+      fallbackWidgetId = typeof widgetId === 'number' ? widgetId : null;
+    }
+
+    return { verifier };
+  } catch (err: any) {
+    cleanupPhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
+    return {
+      verifier: null,
+      error:
+        err?.message ||
+        'Không thể khởi tạo phiên bảo mật reCAPTCHA cho Firebase Phone Authentication.'
+    };
+  }
+}
+
+/**
+ * Khi gửi OTP thất bại, reset hoặc tạo lại RecaptchaVerifier đúng một lần
+ * trên phần tử con mới để người dùng có thể bấm thử lại ngay mà không gặp lỗi.
+ */
+export async function resetOrRecreatePhoneRecaptchaVerifierOnce(
+  containerEl: HTMLElement | null,
+  verifierRef: { current: RecaptchaVerifier | null },
+  widgetIdRef?: { current: number | null }
+): Promise<void> {
+  const g = (window as any).grecaptcha;
+  const currentWidgetId = widgetIdRef ? widgetIdRef.current : fallbackWidgetId;
+  let resetSucceeded = false;
+
+  if (
+    verifierRef.current &&
+    g &&
+    typeof g.reset === 'function' &&
+    typeof currentWidgetId === 'number'
+  ) {
+    try {
+      g.reset(currentWidgetId);
+      resetSucceeded = true;
+    } catch {
+      resetSucceeded = false;
+    }
+  }
+
+  if (!resetSucceeded) {
+    cleanupPhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
+    if (containerEl && document.body.contains(containerEl)) {
+      await ensurePhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
+    }
+  }
+}
+
+function formatFirebasePhoneAuthError(err: any, e164Phone: string): string {
+  const code = String(err?.code || '');
+  const rawMessage = String(err?.message || '');
+
+  if (rawMessage.includes('reCAPTCHA has already been rendered')) {
+    return 'Phiên bảo mật reCAPTCHA vừa được làm mới tự động. Vui lòng bấm gửi mã OTP một lần nữa.';
+  }
+  if (code === 'auth/operation-not-allowed') {
+    return 'Phương thức xác thực Số điện thoại (Phone) chưa được bật trên Firebase Console (Authentication → Sign-in method → Phone). Hệ thống không giả lập OTP; vui lòng bật Phone Auth hoặc chuyển sang xác minh qua Mã Gmail.';
+  }
+  if (code === 'auth/invalid-phone-number') {
+    return `Số điện thoại (${e164Phone}) không hợp lệ theo chuẩn quốc tế E.164 của Firebase Auth.`;
+  }
+  if (code === 'auth/too-many-requests' || code === 'auth/quota-exceeded') {
+    return 'Số điện thoại hoặc thiết bị đã yêu cầu gửi SMS OTP quá giới hạn cho phép của Firebase. Vui lòng đợi ít phút hoặc chọn xác minh qua Mã Gmail.';
+  }
+  if (code === 'auth/captcha-check-failed' || code === 'auth/unauthorized-domain') {
+    return `Xác thực reCAPTCHA không thành công hoặc tên miền hiện tại (${window.location.hostname}) chưa được thêm vào Authorized Domains trong Firebase Console (Authentication → Settings → Authorized domains).`;
+  }
+  if (code === 'auth/billing-not-enabled') {
+    return 'Dự án Firebase cần bật gói Blaze (Pay-as-you-go) để gửi SMS thật hoặc thêm số điện thoại kiểm thử trong Firebase Console (Authentication → Sign-in method → Phone). Bạn cũng có thể chuyển sang xác minh bằng Mã Gmail.';
+  }
+  if (code === 'auth/network-request-failed') {
+    return 'Lỗi kết nối mạng khi liên hệ máy chủ Firebase Phone Authentication. Vui lòng kiểm tra kết nối Internet và thử lại.';
+  }
+  if (code === 'auth/internal-error') {
+    return 'Máy chủ Firebase Phone Authentication trả về lỗi nội bộ (auth/internal-error). Vui lòng kiểm tra cấu hình Phone Auth / Authorized Domains trên Firebase Console hoặc chọn xác minh bằng Mã Gmail.';
+  }
+  return rawMessage || 'Không thể gửi mã OTP qua Firebase Phone Authentication.';
+}
+
+export async function requestFirebasePhoneOtp(
+  rawPhone: string,
+  targetOrRefs: string | PhoneRecaptchaLifecycleRefs
+): Promise<{ sent: boolean; e164Phone: string; error?: string }> {
   const e164Phone = normalizePhoneE164Client(rawPhone);
   if (!/^\+[1-9]\d{8,14}$/.test(e164Phone)) {
     return {
@@ -90,56 +251,102 @@ export async function requestFirebasePhoneOtp(
     };
   }
 
-  try {
-    if (activeRecaptchaVerifier) {
-      try {
-        activeRecaptchaVerifier.clear();
-      } catch {
-        // ignore
-      }
-      activeRecaptchaVerifier = null;
-    }
+  if (isPhoneOtpDispatchInFlight) {
+    return {
+      sent: false,
+      e164Phone,
+      error: 'Đang xử lý yêu cầu gửi mã SMS OTP. Vui lòng đợi trong giây lát.'
+    };
+  }
 
-    const containerEl = document.getElementById(recaptchaContainerId);
-    if (!containerEl) {
+  // Client-side rate-limit guard (only applies after a previous confirmed dispatch)
+  const now = Date.now();
+  if (lastPhoneOtpRequestAt > 0 && now - lastPhoneOtpRequestAt < 15000) {
+    const waitSec = Math.ceil((15000 - (now - lastPhoneOtpRequestAt)) / 1000);
+    return {
+      sent: false,
+      e164Phone,
+      error: `Chống lạm dụng OTP: Vui lòng đợi ${waitSec} giây trước khi yêu cầu gửi lại mã SMS OTP.`
+    };
+  }
+
+  const containerEl =
+    typeof targetOrRefs === 'string'
+      ? document.getElementById(targetOrRefs)
+      : targetOrRefs.containerEl;
+  const verifierRef =
+    typeof targetOrRefs === 'string'
+      ? {
+          get current() {
+            return fallbackRecaptchaVerifier;
+          },
+          set current(v: RecaptchaVerifier | null) {
+            fallbackRecaptchaVerifier = v;
+          }
+        }
+      : targetOrRefs.verifierRef;
+  const widgetIdRef =
+    typeof targetOrRefs === 'string'
+      ? {
+          get current() {
+            return fallbackWidgetId;
+          },
+          set current(v: number | null) {
+            fallbackWidgetId = v;
+          }
+        }
+      : targetOrRefs.widgetIdRef;
+
+  isPhoneOtpDispatchInFlight = true;
+  try {
+    const { verifier, error: initError } = await ensurePhoneRecaptchaVerifier(
+      containerEl,
+      verifierRef,
+      widgetIdRef
+    );
+    if (!verifier) {
       return {
         sent: false,
         e164Phone,
-        error: `Không tìm thấy vùng chứa bảo mật reCAPTCHA (#${recaptchaContainerId}).`
+        error:
+          initError ||
+          'Không tìm thấy hoặc không khởi tạo được vùng bảo mật reCAPTCHA trên trang.'
       };
     }
-    containerEl.innerHTML = '';
 
-    activeRecaptchaVerifier = new RecaptchaVerifier(auth, recaptchaContainerId, {
-      size: 'invisible'
-    });
+    const confirmationResult = await signInWithPhoneNumber(auth, e164Phone, verifier);
+    if (!confirmationResult || typeof confirmationResult.confirm !== 'function') {
+      await resetOrRecreatePhoneRecaptchaVerifierOnce(containerEl, verifierRef, widgetIdRef);
+      return {
+        sent: false,
+        e164Phone,
+        error: 'Firebase chưa xác nhận gửi mã SMS OTP thành công. Vui lòng thử lại.'
+      };
+    }
 
-    const confirmationResult = await signInWithPhoneNumber(
-      auth,
-      e164Phone,
-      activeRecaptchaVerifier
-    );
     activePhoneConfirmationResult = confirmationResult;
     lastPhoneOtpRequestAt = Date.now();
     return { sent: true, e164Phone };
   } catch (err: any) {
-    const code = String(err?.code || '');
-    let message = err?.message || 'Không thể gửi mã OTP qua Firebase Phone Authentication.';
-    if (code === 'auth/operation-not-allowed') {
-      message =
-        'Nhà cung cấp "Phone" trong Firebase Authentication chưa được bật trên Firebase Console (Authentication -> Sign-in method -> Phone -> Enable). Hệ thống không giả lập OTP.';
-    } else if (code === 'auth/invalid-phone-number') {
-      message = `Số điện thoại (${e164Phone}) không hợp lệ theo chuẩn E.164 của Firebase Auth.`;
-    } else if (code === 'auth/too-many-requests') {
-      message = 'Số điện thoại hoặc thiết bị đã yêu cầu OTP quá nhiều lần. Firebase đã tạm chặn để chống lạm dụng.';
-    } else if (code === 'auth/captcha-check-failed' || code === 'auth/unauthorized-domain') {
-      message =
-        'Xác thực reCAPTCHA không thành công hoặc tên miền hiện tại chưa được thêm vào Authorized Domains trong Firebase Authentication.';
-    } else if (code === 'auth/billing-not-enabled') {
-      message =
-        'Dự án Firebase cần bật gói Blaze (Pay-as-you-go) hoặc cấu hình số điện thoại kiểm thử trong Firebase Console -> Authentication -> Sign-in method -> Phone.';
+    activePhoneConfirmationResult = null;
+    // Nếu gặp lỗi "reCAPTCHA has already been rendered", buộc tạo lại verifier trên node con mới đúng 1 lần
+    const rawMsg = String(err?.message || '');
+    if (rawMsg.includes('reCAPTCHA has already been rendered')) {
+      cleanupPhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
+      if (containerEl && document.body.contains(containerEl)) {
+        await ensurePhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
+      }
+    } else {
+      await resetOrRecreatePhoneRecaptchaVerifierOnce(containerEl, verifierRef, widgetIdRef);
     }
-    return { sent: false, e164Phone, error: message };
+
+    return {
+      sent: false,
+      e164Phone,
+      error: formatFirebasePhoneAuthError(err, e164Phone)
+    };
+  } finally {
+    isPhoneOtpDispatchInFlight = false;
   }
 }
 
@@ -149,7 +356,7 @@ export async function confirmFirebasePhoneOtpCode(
   if (!activePhoneConfirmationResult) {
     return {
       verified: false,
-      error: 'Chưa có phiên yêu cầu SMS OTP đang chờ. Vui lòng bấm "Gửi mã OTP qua SMS" trước.'
+      error: 'Chưa có phiên yêu cầu SMS OTP đang chờ. Vui lòng bấm "Gửi mã OTP" trước.'
     };
   }
   const cleanCode = String(otpCode || '').trim();

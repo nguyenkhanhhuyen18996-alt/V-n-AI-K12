@@ -1179,6 +1179,135 @@ function isAuthorizedAdminUid(uid: string): boolean {
   return false;
 }
 
+function stripEnvQuotes(val: string | undefined): string {
+  if (val === undefined || val === null) return '';
+  let trimmed = String(val).trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+  if (trimmed === 'undefined' || trimmed === 'null' || trimmed.startsWith('MY_')) {
+    return '';
+  }
+  return trimmed;
+}
+
+function resolveSmtpAndEmailEnv() {
+  const resendKey = stripEnvQuotes(process.env.RESEND_API_KEY);
+  const rawHost = stripEnvQuotes(
+    process.env.SMTP_HOST || process.env.MAIL_HOST || process.env.EMAIL_HOST
+  );
+  const smtpUser = stripEnvQuotes(
+    process.env.SMTP_USER ||
+      process.env.MAIL_USER ||
+      process.env.EMAIL_USER ||
+      process.env.GMAIL_USER
+  );
+  const rawPass = stripEnvQuotes(
+    process.env.SMTP_PASS ||
+      process.env.SMTP_PASSWORD ||
+      process.env.MAIL_PASS ||
+      process.env.EMAIL_PASS ||
+      process.env.GMAIL_APP_PASSWORD
+  );
+  const smtpHost =
+    rawHost || (smtpUser.toLowerCase().endsWith('@gmail.com') ? 'smtp.gmail.com' : '');
+  const isGmailSmtp = smtpHost.toLowerCase().includes('gmail.com');
+  const smtpPass = isGmailSmtp ? rawPass.replace(/\s+/g, '') : rawPass;
+
+  const rawPort = Number(
+    stripEnvQuotes(process.env.SMTP_PORT || process.env.MAIL_PORT || process.env.EMAIL_PORT) || 465
+  );
+  const smtpPort = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 465;
+  // Port 465 uses implicit TLS (secure=true); Port 587/2525 uses STARTTLS (secure=false)
+  const smtpSecure =
+    smtpPort === 465
+      ? true
+      : smtpPort === 587 || smtpPort === 2525 || smtpPort === 25
+      ? false
+      : process.env.SMTP_SECURE !== undefined
+      ? stripEnvQuotes(process.env.SMTP_SECURE).toLowerCase() === 'true'
+      : false;
+
+  const rawFrom = stripEnvQuotes(
+    process.env.EMAIL_FROM ||
+      process.env.OTP_EMAIL_FROM ||
+      process.env.SMTP_FROM ||
+      process.env.MAIL_FROM
+  );
+  const cleanFrom = rawFrom.includes('no-reply@yourdomain.com') ? '' : rawFrom;
+  const emailFrom =
+    cleanFrom ||
+    (smtpUser ? `VanAI 12 <${smtpUser}>` : 'VanAI 12 <onboarding@resend.dev>');
+  const rawWebhook = stripEnvQuotes(process.env.EMAIL_OTP_WEBHOOK_URL);
+  const webhookUrl = /^https?:\/\/.+/i.test(rawWebhook) ? rawWebhook : '';
+  const testOutboxFile = stripEnvQuotes(process.env.SMTP_TEST_OUTBOX_FILE);
+
+  return {
+    resendKey,
+    smtpHost,
+    smtpPort,
+    smtpSecure,
+    smtpUser,
+    smtpPass,
+    emailFrom,
+    webhookUrl,
+    testOutboxFile
+  };
+}
+
+function formatSafeSmtpError(
+  err: any,
+  smtpHost: string,
+  smtpPort: number,
+  recipientGmail?: string
+): string {
+  const code = String(err?.code || '').toUpperCase();
+  const responseCode = Number(err?.responseCode || 0);
+  const rawMsg = String(err?.message || 'Lỗi không xác định từ máy chủ SMTP');
+
+  if (
+    code === 'EAUTH' ||
+    responseCode === 535 ||
+    responseCode === 534 ||
+    /535|534|invalid login|username and password not accepted|authentication failed|badcredentials/i.test(
+      rawMsg
+    )
+  ) {
+    return `Máy chủ SMTP (${smtpHost}:${smtpPort}) từ chối xác thực tài khoản gửi mail (Mã lỗi EAUTH/535). Nếu sử dụng Gmail SMTP, vui lòng bật xác minh 2 bước và cấu hình Mật khẩu ứng dụng 16 ký tự (Google App Password) cho biến SMTP_PASS.`;
+  }
+
+  if (
+    code === 'ECONNECTION' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ESOCKET' ||
+    code === 'ENOTFOUND' ||
+    code === 'ECONNREFUSED' ||
+    /timed out|getaddrinfo|connect ECONNREFUSED|wrong version number/i.test(rawMsg)
+  ) {
+    return `Không thể kết nối tới máy chủ SMTP (${smtpHost}:${smtpPort} - ${
+      code || 'NETWORK_ERROR'
+    }). Vui lòng kiểm tra lại cấu hình SMTP_HOST, SMTP_PORT (465 cho SSL hoặc 587 cho STARTTLS) trên máy chủ.`;
+  }
+
+  if (
+    code === 'EENVELOPE' ||
+    responseCode === 550 ||
+    responseCode === 553 ||
+    responseCode === 554
+  ) {
+    return `Máy chủ SMTP (${smtpHost}:${smtpPort}) từ chối địa chỉ người gửi hoặc địa chỉ nhận${
+      recipientGmail ? ` (${recipientGmail})` : ''
+    }. Vui lòng kiểm tra lại biến EMAIL_FROM và SMTP_USER.`;
+  }
+
+  return `Máy chủ email (${smtpHost}:${smtpPort}) từ chối gửi thư xác minh (${
+    code || responseCode || 'SMTP_ERROR'
+  }). Vui lòng kiểm tra lại cấu hình SMTP trên máy chủ hoặc chuyển sang phương thức OTP Số điện thoại.`;
+}
+
 // Check if server-side email OTP delivery provider is configured
 function getEmailProviderStatus(): {
   configured: boolean;
@@ -1186,8 +1315,8 @@ function getEmailProviderStatus(): {
   providerName: string;
   missingEnvVars: string[];
 } {
-  const resendKey = (process.env.RESEND_API_KEY || '').trim();
-  if (resendKey) {
+  const env = resolveSmtpAndEmailEnv();
+  if (env.resendKey) {
     return {
       configured: true,
       mode: 'resend',
@@ -1195,19 +1324,15 @@ function getEmailProviderStatus(): {
       missingEnvVars: []
     };
   }
-  const smtpHost = (process.env.SMTP_HOST || '').trim();
-  const smtpUser = (process.env.SMTP_USER || '').trim();
-  const smtpPass = (process.env.SMTP_PASS || '').trim();
-  if (smtpHost && smtpUser && smtpPass) {
-    const smtpPort = Number(process.env.SMTP_PORT || 465);
+  if (env.smtpHost && env.smtpUser && env.smtpPass) {
     return {
       configured: true,
       mode: 'smtp',
-      providerName: `SMTP (${smtpHost}:${smtpPort})`,
+      providerName: `SMTP (${env.smtpHost}:${env.smtpPort})`,
       missingEnvVars: []
     };
   }
-  if ((process.env.EMAIL_OTP_WEBHOOK_URL || '').trim()) {
+  if (env.webhookUrl) {
     return {
       configured: true,
       mode: 'webhook',
@@ -1215,7 +1340,7 @@ function getEmailProviderStatus(): {
       missingEnvVars: []
     };
   }
-  if ((process.env.SMTP_TEST_OUTBOX_FILE || '').trim()) {
+  if (env.testOutboxFile) {
     return {
       configured: true,
       mode: 'test_outbox',
@@ -1224,9 +1349,9 @@ function getEmailProviderStatus(): {
     };
   }
   const missing: string[] = [];
-  if (!smtpHost) missing.push('SMTP_HOST');
-  if (!smtpUser) missing.push('SMTP_USER');
-  if (!smtpPass) missing.push('SMTP_PASS');
+  if (!env.smtpHost) missing.push('SMTP_HOST');
+  if (!env.smtpUser) missing.push('SMTP_USER');
+  if (!env.smtpPass) missing.push('SMTP_PASS');
   missing.push('hoặc RESEND_API_KEY');
   return {
     configured: false,
@@ -1245,6 +1370,7 @@ async function verifyEmailProviderConnectionOnServer(): Promise<{
   error?: string;
 }> {
   const status = getEmailProviderStatus();
+  const env = resolveSmtpAndEmailEnv();
   if (!status.configured) {
     return {
       ready: false,
@@ -1256,8 +1382,7 @@ async function verifyEmailProviderConnectionOnServer(): Promise<{
   }
 
   if (status.mode === 'resend') {
-    const resendKey = (process.env.RESEND_API_KEY || '').trim();
-    if (!resendKey.startsWith('re_') || resendKey.length < 10) {
+    if (!env.resendKey.startsWith('re_') || env.resendKey.length < 10) {
       return {
         ready: false,
         mode: 'resend',
@@ -1275,25 +1400,19 @@ async function verifyEmailProviderConnectionOnServer(): Promise<{
   }
 
   if (status.mode === 'smtp') {
-    const smtpHost = (process.env.SMTP_HOST || '').trim();
-    const smtpPort = Number(process.env.SMTP_PORT || 465);
-    const smtpSecure =
-      process.env.SMTP_SECURE !== undefined
-        ? String(process.env.SMTP_SECURE).toLowerCase() === 'true'
-        : smtpPort === 465;
-    const smtpUser = (process.env.SMTP_USER || '').trim();
-    const smtpPass = (process.env.SMTP_PASS || '').trim();
-
     try {
       const transporter = nodemailer.createTransport({
-        host: smtpHost,
-        port: smtpPort,
-        secure: smtpSecure,
+        host: env.smtpHost,
+        port: env.smtpPort,
+        secure: env.smtpSecure,
+        requireTLS: !env.smtpSecure && env.smtpPort === 587,
         auth: {
-          user: smtpUser,
-          pass: smtpPass
+          user: env.smtpUser,
+          pass: env.smtpPass
         },
-        connectionTimeout: 8000
+        connectionTimeout: 8000,
+        greetingTimeout: 8000,
+        socketTimeout: 10000
       });
       await transporter.verify();
       return {
@@ -1308,7 +1427,7 @@ async function verifyEmailProviderConnectionOnServer(): Promise<{
         mode: 'smtp',
         providerName: status.providerName,
         missingEnvVars: [],
-        error: `Kiểm tra kết nối SMTP (${smtpHost}:${smtpPort}) thất bại: ${err.message}`
+        error: formatSafeSmtpError(err, env.smtpHost, env.smtpPort)
       };
     }
   }
@@ -1327,6 +1446,7 @@ async function sendGmailVerificationCodeViaServer(
   otpCode: string
 ): Promise<{ sent: boolean; error?: string }> {
   const status = getEmailProviderStatus();
+  const env = resolveSmtpAndEmailEnv();
   if (!status.configured) {
     return {
       sent: false,
@@ -1339,65 +1459,63 @@ async function sendGmailVerificationCodeViaServer(
 
   // 1. Resend REST API
   if (status.mode === 'resend') {
-    const resendKey = (process.env.RESEND_API_KEY || '').trim();
-    if (!resendKey.startsWith('re_')) {
+    if (!env.resendKey.startsWith('re_')) {
       return {
         sent: false,
         error: 'Cấu hình RESEND_API_KEY không hợp lệ (Khóa Resend phải bắt đầu bằng "re_").'
       };
     }
     try {
-      const fromAddr = process.env.EMAIL_FROM || 'VanAI 12 <onboarding@resend.dev>';
       const resp = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${resendKey}`,
+          Authorization: `Bearer ${env.resendKey}`,
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          from: fromAddr,
+          from: env.emailFrom,
           to: [recipientGmail],
           subject,
           text: textBody
         })
       });
       if (!resp.ok) {
-        const errBody = await resp.text();
-        return { sent: false, error: `Lỗi từ dịch vụ Resend API (${resp.status}): ${errBody}` };
+        const errData: any = await resp.json().catch(() => ({}));
+        const reason = errData?.message || errData?.error || `HTTP ${resp.status}`;
+        return {
+          sent: false,
+          error: `Dịch vụ gửi mail Resend API từ chối gửi thư (${reason}). Vui lòng kiểm tra cấu hình EMAIL_FROM và RESEND_API_KEY trên máy chủ.`
+        };
       }
       return { sent: true };
     } catch (err: any) {
-      return { sent: false, error: `Không thể kết nối Resend API: ${err.message}` };
+      return {
+        sent: false,
+        error: `Không thể kết nối tới dịch vụ Resend API từ máy chủ (${err?.message || 'Lỗi mạng'}).`
+      };
     }
   }
 
   // 2. Real SMTP via Nodemailer (e.g., smtp.gmail.com with 16-char App Password)
   if (status.mode === 'smtp') {
-    const smtpHost = (process.env.SMTP_HOST || '').trim();
-    const smtpPort = Number(process.env.SMTP_PORT || 465);
-    const smtpSecure =
-      process.env.SMTP_SECURE !== undefined
-        ? String(process.env.SMTP_SECURE).toLowerCase() === 'true'
-        : smtpPort === 465;
-    const smtpUser = (process.env.SMTP_USER || '').trim();
-    const smtpPass = (process.env.SMTP_PASS || '').trim();
-    const fromAddr = process.env.EMAIL_FROM || `VanAI 12 <${smtpUser}>`;
-
     try {
       const transporter = nodemailer.createTransport({
-        host: smtpHost,
-        port: smtpPort,
-        secure: smtpSecure,
+        host: env.smtpHost,
+        port: env.smtpPort,
+        secure: env.smtpSecure,
+        requireTLS: !env.smtpSecure && env.smtpPort === 587,
         auth: {
-          user: smtpUser,
-          pass: smtpPass
+          user: env.smtpUser,
+          pass: env.smtpPass
         },
-        connectionTimeout: 8000
+        connectionTimeout: 8000,
+        greetingTimeout: 8000,
+        socketTimeout: 10000
       });
       // Pre-check SMTP connection & credentials before sending
       await transporter.verify();
       await transporter.sendMail({
-        from: fromAddr,
+        from: env.emailFrom,
         to: recipientGmail,
         subject,
         text: textBody
@@ -1406,15 +1524,15 @@ async function sendGmailVerificationCodeViaServer(
     } catch (err: any) {
       return {
         sent: false,
-        error: `Lỗi gửi mã qua máy chủ SMTP (${smtpHost}:${smtpPort}): ${err.message}`
+        error: formatSafeSmtpError(err, env.smtpHost, env.smtpPort, recipientGmail)
       };
     }
   }
 
   // 3. Custom Email Webhook
-  if (status.mode === 'webhook' && process.env.EMAIL_OTP_WEBHOOK_URL) {
+  if (status.mode === 'webhook' && env.webhookUrl) {
     try {
-      const resp = await fetch(process.env.EMAIL_OTP_WEBHOOK_URL, {
+      const resp = await fetch(env.webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ to: recipientGmail, fullName, otpCode })
@@ -1424,14 +1542,14 @@ async function sendGmailVerificationCodeViaServer(
       }
       return { sent: true };
     } catch (err: any) {
-      return { sent: false, error: `Lỗi gọi Email Webhook: ${err.message}` };
+      return { sent: false, error: `Lỗi kết nối tới Email Webhook (${err?.message || 'Lỗi mạng'}).` };
     }
   }
 
   // 4. Server Test Mail Transport (strictly when SMTP_TEST_OUTBOX_FILE is explicitly set by local test runner)
-  if (status.mode === 'test_outbox' && process.env.SMTP_TEST_OUTBOX_FILE) {
+  if (status.mode === 'test_outbox' && env.testOutboxFile) {
     try {
-      const outboxPath = path.resolve(process.cwd(), process.env.SMTP_TEST_OUTBOX_FILE);
+      const outboxPath = path.resolve(process.cwd(), env.testOutboxFile);
       let currentOutbox: any[] = [];
       if (fs.existsSync(outboxPath)) {
         currentOutbox = JSON.parse(fs.readFileSync(outboxPath, 'utf-8') || '[]');
@@ -1453,6 +1571,105 @@ async function sendGmailVerificationCodeViaServer(
     sent: false,
     error: 'Chưa cấu hình dịch vụ gửi email hợp lệ (RESEND_API_KEY hoặc SMTP_HOST/SMTP_USER/SMTP_PASS).'
   };
+}
+
+// Encrypt / Decrypt Teacher Registration State for Serverless Multi-Instance Continuity (AES-256-GCM)
+// Strictly never includes plaintext OTP; only stores salted PBKDF2 hash inside an AES-256-GCM encrypted envelope.
+function getTeacherStateEncryptionKey(): Buffer {
+  return crypto
+    .createHash('sha256')
+    .update(`teacher_reg_aes256gcm:${SESSION_SECRET}`)
+    .digest();
+}
+
+function encodeTeacherRegistrationStateToken(
+  reg: StoredTeacherRegistration,
+  acc?: StoredUserAccount
+): string {
+  try {
+    const key = getTeacherStateEncryptionKey();
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const plaintext = JSON.stringify({
+      reg,
+      acc,
+      exp: Date.now() + 24 * 3600 * 1000
+    });
+    const encrypted = Buffer.concat([cipher.update(plaintext, 'utf-8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    return `${iv.toString('base64url')}.${authTag.toString('base64url')}.${encrypted.toString('base64url')}`;
+  } catch {
+    return '';
+  }
+}
+
+function hydrateTeacherRegistrationFromStateToken(
+  registrationId: string,
+  stateToken: string | undefined,
+  registrations: StoredTeacherRegistration[],
+  accounts: StoredUserAccount[]
+): StoredTeacherRegistration | undefined {
+  const existing = registrations.find(
+    (r) => r.id === registrationId || r.teacherUid === registrationId
+  );
+  if (!stateToken || typeof stateToken !== 'string') {
+    return existing;
+  }
+
+  try {
+    const parts = stateToken.split('.');
+    if (parts.length !== 3) return existing;
+    const [ivB64, tagB64, dataB64] = parts;
+    const key = getTeacherStateEncryptionKey();
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      key,
+      Buffer.from(ivB64, 'base64url')
+    );
+    decipher.setAuthTag(Buffer.from(tagB64, 'base64url'));
+    const decrypted = Buffer.concat([
+      decipher.update(Buffer.from(dataB64, 'base64url')),
+      decipher.final()
+    ]).toString('utf-8');
+    const parsed = JSON.parse(decrypted);
+    if (!parsed || !parsed.reg || Date.now() > Number(parsed.exp || 0)) {
+      return existing;
+    }
+
+    const tokenReg = parsed.reg as StoredTeacherRegistration;
+    if (tokenReg.id !== registrationId && tokenReg.teacherUid !== registrationId) {
+      return existing;
+    }
+
+    if (!existing) {
+      registrations.unshift(tokenReg);
+      saveTeacherRegistrations(registrations);
+      if (parsed.acc && !accounts.some((a) => a.id === parsed.acc.id)) {
+        accounts.push(parsed.acc as StoredUserAccount);
+        saveServerAccounts(accounts);
+      }
+      return tokenReg;
+    }
+
+    // Merge OTP hash fields if the token holds a newer OTP issuance from another Serverless instance
+    if (
+      tokenReg.gmailOtpHash &&
+      (!existing.gmailOtpHash ||
+        new Date(tokenReg.updatedAt || 0).getTime() > new Date(existing.updatedAt || 0).getTime())
+    ) {
+      existing.gmailOtpHash = tokenReg.gmailOtpHash;
+      existing.gmailOtpSalt = tokenReg.gmailOtpSalt;
+      existing.gmailOtpExpiresAt = tokenReg.gmailOtpExpiresAt;
+      existing.gmailOtpAttempts = tokenReg.gmailOtpAttempts || 0;
+      existing.lastOtpSentAt = tokenReg.lastOtpSentAt;
+      existing.updatedAt = tokenReg.updatedAt;
+      saveTeacherRegistrations(registrations);
+    }
+
+    return existing;
+  } catch {
+    return existing;
+  }
 }
 
 // Verify Firebase Phone Auth ID Token against Google Identity Toolkit API
@@ -1994,6 +2211,7 @@ export function createApiApp(): express.Express {
       res.json({
         success: true,
         registration: sanitizeRegistrationForClient(existingReg, classes, accounts),
+        registrationStateToken: encodeTeacherRegistrationStateToken(existingReg, linkedAcc),
         emailProviderStatus: getEmailProviderStatus(),
         message: existingReg.isOwnershipVerified
           ? 'Yêu cầu của bạn đã xác minh quyền sở hữu và đang chờ Quản trị viên duyệt.'
@@ -2058,6 +2276,10 @@ export function createApiApp(): express.Express {
     res.json({
       success: true,
       registration: sanitizeRegistrationForClient(newRegistration, classes, accounts),
+      registrationStateToken: encodeTeacherRegistrationStateToken(
+        newRegistration,
+        newTeacherAccount
+      ),
       emailProviderStatus: getEmailProviderStatus(),
       message:
         'Đã ghi nhận hồ sơ đăng ký Giáo viên. Vui lòng xác minh quyền sở hữu Số điện thoại hoặc Gmail để chuyển sang danh sách chờ Quản trị viên duyệt.'
@@ -2088,14 +2310,20 @@ export function createApiApp(): express.Express {
 
   // Send Gmail OTP (Generated on Server, hashed with PBKDF2, NEVER stored in plaintext or returned to client)
   app.post('/api/teacher-registration/send-gmail-otp', async (req, res) => {
-    const { registrationId } = req.body || {};
+    const { registrationId, registrationStateToken } = req.body || {};
     if (!registrationId) {
       res.status(400).json({ success: false, message: 'Thiếu mã hồ sơ đăng ký (registrationId).' });
       return;
     }
 
     const registrations = loadTeacherRegistrations();
-    const reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
+    const accounts = loadServerAccounts();
+    const reg = hydrateTeacherRegistrationFromStateToken(
+      String(registrationId),
+      registrationStateToken,
+      registrations,
+      accounts
+    );
     if (!reg) {
       res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ đăng ký giáo viên.' });
       return;
@@ -2120,7 +2348,7 @@ export function createApiApp(): express.Express {
         success: false,
         providerConfigured: false,
         missingEnvVars: providerStatus.missingEnvVars,
-        message: `Chưa thể gửi mã xác minh đến Gmail (${reg.gmail}) vì máy chủ thiếu cấu hình dịch vụ gửi email (${providerStatus.missingEnvVars.join(', ')}). Hệ thống không tạo mã giả lập và không tự động xác minh. Vui lòng bật dịch vụ gửi mail trên máy chủ hoặc chọn xác minh qua OTP Số điện thoại (Firebase Phone Auth).`
+        message: `Chưa thể gửi mã xác minh đến Gmail (${reg.gmail}) vì máy chủ thiếu cấu hình dịch vụ gửi email (${providerStatus.missingEnvVars.join(', ')}). Hệ thống không tạo mã giả lập và không tự động xác minh. Vui lòng cấu hình biến môi trường SMTP/Resend trên máy chủ hoặc chọn xác minh qua OTP Số điện thoại (Firebase Phone Auth).`
       });
       return;
     }
@@ -2150,18 +2378,21 @@ export function createApiApp(): express.Express {
     reg.updatedAt = new Date().toISOString();
     saveTeacherRegistrations(registrations);
 
+    const linkedAcc = accounts.find((a) => a.id === reg.teacherUid);
+
     res.json({
       success: true,
       providerConfigured: true,
       providerName: providerStatus.providerName,
       expiresAt: reg.gmailOtpExpiresAt,
+      registrationStateToken: encodeTeacherRegistrationStateToken(reg, linkedAcc),
       message: `Đã gửi mã xác minh 6 chữ số tới địa chỉ Gmail ${reg.gmail}. Mã có hiệu lực trong 10 phút.`
     });
   });
 
   // Verify Gmail OTP against server-side salted PBKDF2 hash
   app.post('/api/teacher-registration/verify-gmail-otp', (req, res) => {
-    const { registrationId, otpCode } = req.body || {};
+    const { registrationId, otpCode, registrationStateToken } = req.body || {};
     if (!registrationId || !otpCode) {
       res.status(400).json({
         success: false,
@@ -2173,7 +2404,12 @@ export function createApiApp(): express.Express {
     const registrations = loadTeacherRegistrations();
     const accounts = loadServerAccounts();
     const classes = loadServerClasses();
-    const reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
+    const reg = hydrateTeacherRegistrationFromStateToken(
+      String(registrationId),
+      registrationStateToken,
+      registrations,
+      accounts
+    );
 
     if (!reg) {
       res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ đăng ký giáo viên.' });
@@ -2212,9 +2448,11 @@ export function createApiApp(): express.Express {
 
     if (!isMatch) {
       saveTeacherRegistrations(registrations);
+      const linkedAcc = accounts.find((a) => a.id === reg.teacherUid);
       res.status(401).json({
         success: false,
         remainingAttempts: Math.max(0, 5 - reg.gmailOtpAttempts),
+        registrationStateToken: encodeTeacherRegistrationStateToken(reg, linkedAcc),
         message: `Mã xác minh Gmail không chính xác. Còn ${Math.max(0, 5 - reg.gmailOtpAttempts)} lần thử.`
       });
       return;
@@ -2248,6 +2486,7 @@ export function createApiApp(): express.Express {
     res.json({
       success: true,
       registration: sanitizeRegistrationForClient(reg, classes, accounts),
+      registrationStateToken: encodeTeacherRegistrationStateToken(reg, teacherAcc),
       message:
         'Xác minh quyền sở hữu Gmail thành công! Yêu cầu đăng ký của bạn đã chuyển sang trạng thái "Chờ quản trị viên duyệt".'
     });
@@ -2255,7 +2494,7 @@ export function createApiApp(): express.Express {
 
   // Verify Phone OTP via Real Firebase Phone Authentication Token
   app.post('/api/teacher-registration/verify-phone-otp', async (req, res) => {
-    const { registrationId, firebaseIdToken } = req.body || {};
+    const { registrationId, firebaseIdToken, registrationStateToken } = req.body || {};
     if (!registrationId || !firebaseIdToken) {
       res.status(400).json({
         success: false,
@@ -2267,7 +2506,12 @@ export function createApiApp(): express.Express {
     const registrations = loadTeacherRegistrations();
     const accounts = loadServerAccounts();
     const classes = loadServerClasses();
-    const reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
+    const reg = hydrateTeacherRegistrationFromStateToken(
+      String(registrationId),
+      registrationStateToken,
+      registrations,
+      accounts
+    );
 
     if (!reg) {
       res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ đăng ký giáo viên.' });
@@ -2312,6 +2556,7 @@ export function createApiApp(): express.Express {
     res.json({
       success: true,
       registration: sanitizeRegistrationForClient(reg, classes, accounts),
+      registrationStateToken: encodeTeacherRegistrationStateToken(reg, teacherAcc),
       message:
         'Xác minh OTP Số điện thoại qua Firebase Phone Auth thành công! Yêu cầu của bạn đã chuyển sang trạng thái "Chờ quản trị viên duyệt".'
     });
@@ -2337,9 +2582,11 @@ export function createApiApp(): express.Express {
       return;
     }
 
+    const linkedAcc = accounts.find((a) => a.id === reg.teacherUid);
     res.json({
       found: true,
       registration: sanitizeRegistrationForClient(reg, classes, accounts),
+      registrationStateToken: encodeTeacherRegistrationStateToken(reg, linkedAcc),
       emailProviderStatus: getEmailProviderStatus()
     });
   });

@@ -325,6 +325,57 @@ export async function triggerServerAdminClaimBootstrap(
 // ============================================================================
 // TEACHER REGISTRATION & OWNERSHIP VERIFICATION (PHONE OTP / GMAIL OTP)
 // ============================================================================
+const STORAGE_KEY_TEACHER_REG_STATE_TOKEN = 'vanai12_teacher_reg_state_token_v2';
+
+function saveTeacherRegistrationStateToken(token?: string | null): void {
+  try {
+    if (token && typeof token === 'string') {
+      sessionStorage.setItem(STORAGE_KEY_TEACHER_REG_STATE_TOKEN, token);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function getTeacherRegistrationStateToken(): string | undefined {
+  try {
+    return sessionStorage.getItem(STORAGE_KEY_TEACHER_REG_STATE_TOKEN) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function checkTeacherEmailConfigOnServer(): Promise<{
+  ready: boolean;
+  mode: string;
+  providerName: string;
+  missingEnvVars: string[];
+  message: string;
+}> {
+  const result = await safeFetchJson<any>('/api/teacher-registration/email-config-check');
+  if (result.isJson && result.data) {
+    return {
+      ready: Boolean(result.ok && result.data.ready),
+      mode: String(result.data.mode || 'unconfigured'),
+      providerName: String(result.data.providerName || 'Chưa cấu hình'),
+      missingEnvVars: Array.isArray(result.data.missingEnvVars) ? result.data.missingEnvVars : [],
+      message:
+        result.data.message ||
+        result.errorMessage ||
+        'Không thể kiểm tra cấu hình dịch vụ gửi email trên máy chủ.'
+    };
+  }
+  return {
+    ready: false,
+    mode: 'unconfigured',
+    providerName: 'Không kết nối được API kiểm tra email',
+    missingEnvVars: [],
+    message:
+      result.errorMessage ||
+      `Không thể kiểm tra trạng thái SMTP/Email trên máy chủ (HTTP ${result.status}).`
+  };
+}
+
 export async function submitTeacherRegistration(payload: {
   username?: string;
   fullName: string;
@@ -337,44 +388,83 @@ export async function submitTeacherRegistration(payload: {
   registration?: TeacherRegistrationRecord;
   emailProviderStatus?: {
     configured: boolean;
+    mode?: string;
     providerName: string;
     missingEnvVars: string[];
   };
   message: string;
 }> {
-  const res = await fetch('/api/teacher-registration/submit', {
+  const result = await safeFetchJson<any>('/api/teacher-registration/submit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
-  const data = await res.json();
+
+  if (!result.isJson || !result.data) {
+    return {
+      success: false,
+      message:
+        result.errorMessage ||
+        `Lỗi kết nối máy chủ khi gửi hồ sơ đăng ký giáo viên (HTTP ${result.status}).`
+    };
+  }
+
+  const data = result.data;
+  if (data.registrationStateToken) {
+    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  }
+
   return {
-    success: Boolean(res.ok && data.success),
+    success: Boolean(result.ok && data.success),
     registration: data.registration,
     emailProviderStatus: data.emailProviderStatus,
-    message: data.message || (res.ok ? 'Gửi yêu cầu thành công.' : 'Lỗi gửi yêu cầu đăng ký.')
+    message:
+      data.message ||
+      result.errorMessage ||
+      (result.ok ? 'Gửi yêu cầu thành công.' : 'Lỗi gửi yêu cầu đăng ký.')
   };
 }
 
 export async function sendTeacherGmailOtp(registrationId: string): Promise<{
   success: boolean;
   providerConfigured?: boolean;
+  providerName?: string;
   missingEnvVars?: string[];
   expiresAt?: string;
   message: string;
 }> {
-  const res = await fetch('/api/teacher-registration/send-gmail-otp', {
+  const registrationStateToken = getTeacherRegistrationStateToken();
+  const result = await safeFetchJson<any>('/api/teacher-registration/send-gmail-otp', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ registrationId })
+    body: JSON.stringify({ registrationId, registrationStateToken })
   });
-  const data = await res.json();
+
+  if (!result.isJson || !result.data) {
+    return {
+      success: false,
+      providerConfigured: false,
+      message:
+        result.errorMessage ||
+        `Không thể kết nối tới API gửi mã OTP email trên máy chủ (HTTP ${result.status}).`
+    };
+  }
+
+  const data = result.data;
+  if (data.registrationStateToken) {
+    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  }
+
   return {
-    success: Boolean(res.ok && data.success),
+    success: Boolean(result.ok && data.success),
     providerConfigured: data.providerConfigured,
+    providerName: data.providerName,
     missingEnvVars: data.missingEnvVars,
     expiresAt: data.expiresAt,
-    message: data.message || 'Không thể gửi mã xác minh Gmail.'
+    message:
+      data.message ||
+      result.errorMessage ||
+      'Không thể gửi mã xác minh Gmail từ máy chủ.'
   };
 }
 
@@ -386,16 +476,34 @@ export async function verifyTeacherGmailOtp(
   registration?: TeacherRegistrationRecord;
   message: string;
 }> {
-  const res = await fetch('/api/teacher-registration/verify-gmail-otp', {
+  const registrationStateToken = getTeacherRegistrationStateToken();
+  const result = await safeFetchJson<any>('/api/teacher-registration/verify-gmail-otp', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ registrationId, otpCode })
+    body: JSON.stringify({ registrationId, otpCode, registrationStateToken })
   });
-  const data = await res.json();
+
+  if (!result.isJson || !result.data) {
+    return {
+      success: false,
+      message:
+        result.errorMessage ||
+        `Lỗi kết nối máy chủ khi xác minh mã Gmail (HTTP ${result.status}).`
+    };
+  }
+
+  const data = result.data;
+  if (data.registrationStateToken) {
+    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  }
+
   return {
-    success: Boolean(res.ok && data.success),
+    success: Boolean(result.ok && data.success),
     registration: data.registration,
-    message: data.message || 'Xác minh mã Gmail không thành công.'
+    message:
+      data.message ||
+      result.errorMessage ||
+      'Xác minh mã Gmail không thành công.'
   };
 }
 
@@ -407,32 +515,68 @@ export async function verifyTeacherPhoneOtp(
   registration?: TeacherRegistrationRecord;
   message: string;
 }> {
-  const res = await fetch('/api/teacher-registration/verify-phone-otp', {
+  const registrationStateToken = getTeacherRegistrationStateToken();
+  const result = await safeFetchJson<any>('/api/teacher-registration/verify-phone-otp', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ registrationId, firebaseIdToken })
+    body: JSON.stringify({ registrationId, firebaseIdToken, registrationStateToken })
   });
-  const data = await res.json();
+
+  if (!result.isJson || !result.data) {
+    return {
+      success: false,
+      message:
+        result.errorMessage ||
+        `Lỗi kết nối máy chủ khi xác minh OTP Số điện thoại (HTTP ${result.status}).`
+    };
+  }
+
+  const data = result.data;
+  if (data.registrationStateToken) {
+    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  }
+
   return {
-    success: Boolean(res.ok && data.success),
+    success: Boolean(result.ok && data.success),
     registration: data.registration,
-    message: data.message || 'Xác minh OTP Số điện thoại không thành công.'
+    message:
+      data.message ||
+      result.errorMessage ||
+      'Xác minh OTP Số điện thoại không thành công.'
   };
 }
 
 export async function fetchTeacherRegistrationStatus(identifier: string): Promise<{
   found: boolean;
   registration?: TeacherRegistrationRecord;
+  emailProviderStatus?: {
+    configured: boolean;
+    mode?: string;
+    providerName: string;
+    missingEnvVars: string[];
+  };
   message?: string;
 }> {
-  const res = await fetch(
+  const result = await safeFetchJson<any>(
     `/api/teacher-registration/status/${encodeURIComponent(identifier.trim())}`
   );
-  const data = await res.json();
+  if (!result.isJson || !result.data) {
+    return {
+      found: false,
+      message:
+        result.errorMessage ||
+        `Không thể tra cứu hồ sơ đăng ký giáo viên (HTTP ${result.status}).`
+    };
+  }
+  const data = result.data;
+  if (data.registrationStateToken) {
+    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  }
   return {
-    found: Boolean(res.ok && data.found),
+    found: Boolean(result.ok && data.found),
     registration: data.registration,
-    message: data.message
+    emailProviderStatus: data.emailProviderStatus,
+    message: data.message || result.errorMessage
   };
 }
 
