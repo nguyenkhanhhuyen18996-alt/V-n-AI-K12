@@ -179,9 +179,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
   useEffect(() => {
     let cancelled = false;
+    const mountedContainerEl = recaptchaContainerRef.current;
+
     if (!isPhoneOtpViewActive) {
       cleanupPhoneRecaptchaVerifier(
-        recaptchaContainerRef.current,
+        mountedContainerEl,
         recaptchaVerifierRef,
         recaptchaWidgetIdRef
       );
@@ -189,19 +191,20 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
 
     const timer = window.setTimeout(() => {
-      if (cancelled || !recaptchaContainerRef.current) return;
+      const targetEl = recaptchaContainerRef.current;
+      if (cancelled || !targetEl || !document.body.contains(targetEl)) return;
       ensurePhoneRecaptchaVerifier(
-        recaptchaContainerRef.current,
+        targetEl,
         recaptchaVerifierRef,
         recaptchaWidgetIdRef
       ).catch(() => {});
-    }, 50);
+    }, 30);
 
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
       cleanupPhoneRecaptchaVerifier(
-        recaptchaContainerRef.current,
+        recaptchaContainerRef.current || mountedContainerEl,
         recaptchaVerifierRef,
         recaptchaWidgetIdRef
       );

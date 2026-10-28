@@ -40,10 +40,45 @@ import {
   saveStudentStateToServer
 } from './accountService';
 
+// Chuẩn hóa cấu hình Firebase: ưu tiên biến môi trường VITE_FIREBASE_* (nếu cấu hình trên Vercel) và fallback về firebase-applet-config.json
+const envMeta = (import.meta as any)?.env || {};
+const effectiveFirebaseConfig = {
+  ...firebaseConfig,
+  apiKey: String(envMeta.VITE_FIREBASE_API_KEY || firebaseConfig.apiKey || '').trim(),
+  authDomain: String(envMeta.VITE_FIREBASE_AUTH_DOMAIN || firebaseConfig.authDomain || '').trim(),
+  projectId: String(envMeta.VITE_FIREBASE_PROJECT_ID || firebaseConfig.projectId || '').trim(),
+  appId: String(envMeta.VITE_FIREBASE_APP_ID || firebaseConfig.appId || '').trim(),
+  storageBucket: String(
+    envMeta.VITE_FIREBASE_STORAGE_BUCKET || firebaseConfig.storageBucket || ''
+  ).trim(),
+  messagingSenderId: String(
+    envMeta.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseConfig.messagingSenderId || ''
+  ).trim(),
+  firestoreDatabaseId: String(
+    envMeta.VITE_FIREBASE_FIRESTORE_DATABASE_ID ||
+      (firebaseConfig as any).firestoreDatabaseId ||
+      ''
+  ).trim()
+};
+
 // Initialize Firebase App & Firestore Database singleton
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
-export const db = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
+const app = getApps().length === 0 ? initializeApp(effectiveFirebaseConfig) : getApp();
+export const db = effectiveFirebaseConfig.firestoreDatabaseId
+  ? getFirestore(app, effectiveFirebaseConfig.firestoreDatabaseId)
+  : getFirestore(app);
 export const auth = getAuth(app);
+
+export function getClientFirebaseProjectInfo(): {
+  projectId: string;
+  authDomain: string;
+  currentHostname: string;
+} {
+  return {
+    projectId: effectiveFirebaseConfig.projectId || 'unknown-project',
+    authDomain: effectiveFirebaseConfig.authDomain || '',
+    currentHostname: typeof window !== 'undefined' ? window.location.hostname : ''
+  };
+}
 
 // ============================================================================
 // FIREBASE PHONE AUTHENTICATION (REAL SMS OTP + RECAPTCHA LIFECYCLE VIA REF)
@@ -56,6 +91,14 @@ export interface PhoneRecaptchaLifecycleRefs {
 
 let fallbackRecaptchaVerifier: RecaptchaVerifier | null = null;
 let fallbackWidgetId: number | null = null;
+let activeRecaptchaMountNode: HTMLElement | null = null;
+let activeInFlightVerifier: RecaptchaVerifier | null = null;
+let activeVerifierInitPromise: Promise<{
+  verifier: RecaptchaVerifier | null;
+  error?: string;
+}> | null = null;
+let recaptchaLifecycleGeneration = 0;
+let recaptchaMountSeq = 0;
 let activePhoneConfirmationResult: ConfirmationResult | null = null;
 let lastPhoneOtpRequestAt = 0;
 let isPhoneOtpDispatchInFlight = false;
@@ -74,8 +117,25 @@ export function normalizePhoneE164Client(rawPhone: string): string {
   return digits.startsWith('+') ? digits : `+${digits}`;
 }
 
+function isRecaptchaVerifierUsable(
+  verifier: RecaptchaVerifier | null,
+  containerEl: HTMLElement | null
+): boolean {
+  if (!verifier || !containerEl) return false;
+  if (typeof document === 'undefined' || !document.body.contains(containerEl)) return false;
+  if ((verifier as any).destroyed) return false;
+  if (
+    !activeRecaptchaMountNode ||
+    !document.body.contains(activeRecaptchaMountNode) ||
+    !containerEl.contains(activeRecaptchaMountNode)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 /**
- * Dọn dẹp triệt để RecaptchaVerifier hiện tại và giải phóng phần tử DOM
+ * Dọn dẹp triệt để RecaptchaVerifier hiện tại và giải phóng phần tử DOM con
  * khi đóng biểu mẫu, chuyển tab hoặc đổi phương thức xác minh.
  */
 export function cleanupPhoneRecaptchaVerifier(
@@ -83,24 +143,43 @@ export function cleanupPhoneRecaptchaVerifier(
   verifierRef?: { current: RecaptchaVerifier | null },
   widgetIdRef?: { current: number | null }
 ): void {
+  recaptchaLifecycleGeneration += 1;
+  activeVerifierInitPromise = null;
+
   const targetVerifier = verifierRef ? verifierRef.current : fallbackRecaptchaVerifier;
-  if (targetVerifier) {
+  const verifiersToClear = new Set<RecaptchaVerifier>();
+  if (targetVerifier) verifiersToClear.add(targetVerifier);
+  if (activeInFlightVerifier) verifiersToClear.add(activeInFlightVerifier);
+  if (fallbackRecaptchaVerifier) verifiersToClear.add(fallbackRecaptchaVerifier);
+
+  verifiersToClear.forEach((v) => {
     try {
-      targetVerifier.clear();
+      v.clear();
     } catch {
       // ignore cleanup errors on detached DOM nodes
     }
-  }
+  });
+
+  activeInFlightVerifier = null;
+  fallbackRecaptchaVerifier = null;
   if (verifierRef) {
     verifierRef.current = null;
-  } else {
-    fallbackRecaptchaVerifier = null;
   }
+
+  fallbackWidgetId = null;
   if (widgetIdRef) {
     widgetIdRef.current = null;
-  } else {
-    fallbackWidgetId = null;
   }
+
+  if (activeRecaptchaMountNode) {
+    try {
+      activeRecaptchaMountNode.remove();
+    } catch {
+      // ignore
+    }
+    activeRecaptchaMountNode = null;
+  }
+
   if (containerEl) {
     try {
       containerEl.innerHTML = '';
@@ -111,82 +190,163 @@ export function cleanupPhoneRecaptchaVerifier(
 }
 
 /**
- * Chỉ khởi tạo RecaptchaVerifier một lần sau khi phần tử chứa đã có trên trang.
- * Gắn verifier vào một nút DOM con mới bên trong container để tuyệt đối không bao giờ
- * xảy ra lỗi "reCAPTCHA has already been rendered in this element".
+ * Chỉ khởi tạo một RecaptchaVerifier duy nhất cho phần tử reCAPTCHA sau khi phần tử đã có trên trang.
+ * Đồng bộ hóa mọi lời gọi song song qua activeVerifierInitPromise và khóa verifier.render()
+ * sau khi render thành công để tránh lỗi widgetId === 0 trong @firebase/auth v13 gây ra
+ * "reCAPTCHA has already been rendered in this element".
  */
 export async function ensurePhoneRecaptchaVerifier(
   containerEl: HTMLElement | null,
   verifierRef: { current: RecaptchaVerifier | null },
   widgetIdRef?: { current: number | null }
 ): Promise<{ verifier: RecaptchaVerifier | null; error?: string }> {
-  if (verifierRef.current) {
-    return { verifier: verifierRef.current };
-  }
-
-  if (!containerEl || !document.body.contains(containerEl)) {
+  if (!containerEl || typeof document === 'undefined' || !document.body.contains(containerEl)) {
     return {
       verifier: null,
       error: 'Phần tử bảo mật reCAPTCHA chưa sẵn sàng trên trang. Vui lòng thử lại.'
     };
   }
 
-  try {
-    containerEl.innerHTML = '';
-    const mountNode = document.createElement('div');
-    mountNode.className = 'firebase-recaptcha-mount-node';
-    containerEl.appendChild(mountNode);
+  // Nếu đã có verifier hợp lệ và phần tử mountNode vẫn đang gắn trong containerEl thì tái sử dụng ngay
+  if (isRecaptchaVerifierUsable(verifierRef.current, containerEl)) {
+    return { verifier: verifierRef.current };
+  }
 
-    const verifier = new RecaptchaVerifier(auth, mountNode, {
-      size: 'invisible',
-      'expired-callback': () => {
-        const g = (window as any).grecaptcha;
-        const wId = widgetIdRef ? widgetIdRef.current : fallbackWidgetId;
-        if (g && typeof g.reset === 'function' && typeof wId === 'number') {
-          try {
-            g.reset(wId);
-          } catch {
-            // ignore
+  // Nếu đang có một tiến trình khởi tạo RecaptchaVerifier chạy dở trên trang, đợi đúng tiến trình đó
+  // thay vì tạo thêm instance thứ hai gây xung đột "reCAPTCHA has already been rendered in this element"
+  if (activeVerifierInitPromise) {
+    const pendingResult = await activeVerifierInitPromise;
+    if (isRecaptchaVerifierUsable(pendingResult.verifier, containerEl)) {
+      verifierRef.current = pendingResult.verifier;
+      return pendingResult;
+    }
+  }
+
+  // Dọn sạch trạng thái cũ (nếu có) trước khi gắn vào nút DOM con hoàn toàn mới
+  cleanupPhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
+  const currentGeneration = recaptchaLifecycleGeneration;
+
+  let initTask: Promise<{
+    verifier: RecaptchaVerifier | null;
+    error?: string;
+  }> | null = null;
+
+  initTask = (async (): Promise<{
+    verifier: RecaptchaVerifier | null;
+    error?: string;
+  }> => {
+    try {
+      if (!document.body.contains(containerEl)) {
+        return {
+          verifier: null,
+          error: 'Phần tử bảo mật reCAPTCHA đã bị đóng trước khi khởi tạo xong.'
+        };
+      }
+
+      containerEl.innerHTML = '';
+      const mountNode = document.createElement('div');
+      mountNode.id = `firebase-phone-recaptcha-node-${++recaptchaMountSeq}-${Date.now()}`;
+      mountNode.className = 'firebase-recaptcha-mount-node';
+      containerEl.appendChild(mountNode);
+      activeRecaptchaMountNode = mountNode;
+
+      const verifier = new RecaptchaVerifier(auth, mountNode, {
+        size: 'invisible',
+        'expired-callback': () => {
+          const g = (window as any).grecaptcha;
+          const wId = widgetIdRef ? widgetIdRef.current : fallbackWidgetId;
+          if (g && typeof g.reset === 'function' && typeof wId === 'number') {
+            try {
+              g.reset(wId);
+            } catch {
+              // ignore
+            }
           }
         }
+      });
+
+      activeInFlightVerifier = verifier;
+      verifierRef.current = verifier;
+      fallbackRecaptchaVerifier = verifier;
+
+      const widgetId = await verifier.render();
+
+      // Kiểm tra nếu form đã đóng hoặc chuyển tab trong lúc đang tải script reCAPTCHA
+      if (
+        currentGeneration !== recaptchaLifecycleGeneration ||
+        !document.body.contains(mountNode)
+      ) {
+        try {
+          verifier.clear();
+        } catch {
+          // ignore
+        }
+        return {
+          verifier: null,
+          error: 'Phiên khởi tạo reCAPTCHA đã được hủy do thay đổi giao diện.'
+        };
       }
-    });
 
-    const widgetId = await verifier.render();
-    verifierRef.current = verifier;
-    if (widgetIdRef) {
-      widgetIdRef.current = typeof widgetId === 'number' ? widgetId : null;
-    } else {
-      fallbackWidgetId = typeof widgetId === 'number' ? widgetId : null;
+      const normalizedWidgetId = typeof widgetId === 'number' ? widgetId : 0;
+      // Khóa hàm render() trên instance đã khởi tạo để @firebase/auth (makeRenderPromise kiểm tra !this.widgetId với widgetId === 0)
+      // không bao giờ gọi lại grecaptcha.render() lần thứ hai trên cùng một phần tử
+      const resolvedWidgetPromise = Promise.resolve(normalizedWidgetId);
+      verifier.render = () => resolvedWidgetPromise;
+
+      activeInFlightVerifier = null;
+      verifierRef.current = verifier;
+      fallbackRecaptchaVerifier = verifier;
+      if (widgetIdRef) {
+        widgetIdRef.current = normalizedWidgetId;
+      }
+      fallbackWidgetId = normalizedWidgetId;
+
+      return { verifier };
+    } catch (err: any) {
+      cleanupPhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
+      return {
+        verifier: null,
+        error:
+          err?.message ||
+          'Không thể khởi tạo phiên bảo mật reCAPTCHA cho Firebase Phone Authentication.'
+      };
+    } finally {
+      if (activeVerifierInitPromise === initTask) {
+        activeVerifierInitPromise = null;
+      }
     }
+  })();
 
-    return { verifier };
-  } catch (err: any) {
-    cleanupPhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
-    return {
-      verifier: null,
-      error:
-        err?.message ||
-        'Không thể khởi tạo phiên bảo mật reCAPTCHA cho Firebase Phone Authentication.'
-    };
-  }
+  activeVerifierInitPromise = initTask;
+  return await initTask;
 }
 
 /**
  * Khi gửi OTP thất bại, reset hoặc tạo lại RecaptchaVerifier đúng một lần
- * trên phần tử con mới để người dùng có thể bấm thử lại ngay mà không gặp lỗi.
+ * trên phần tử DOM con mới để người dùng có thể bấm thử lại ngay mà không gặp lỗi.
  */
 export async function resetOrRecreatePhoneRecaptchaVerifierOnce(
   containerEl: HTMLElement | null,
   verifierRef: { current: RecaptchaVerifier | null },
-  widgetIdRef?: { current: number | null }
+  widgetIdRef?: { current: number | null },
+  lastError?: unknown
 ): Promise<void> {
+  const rawErrorMsg = String((lastError as any)?.message || '');
+  const errorCode = String((lastError as any)?.code || '');
+  const mustRecreateFreshNode =
+    rawErrorMsg.includes('already been rendered') ||
+    rawErrorMsg.includes('client element has been removed') ||
+    rawErrorMsg.includes('No reCAPTCHA clients exist') ||
+    errorCode === 'auth/captcha-check-failed' ||
+    errorCode === 'auth/internal-error';
+
   const g = (window as any).grecaptcha;
   const currentWidgetId = widgetIdRef ? widgetIdRef.current : fallbackWidgetId;
   let resetSucceeded = false;
 
   if (
-    verifierRef.current &&
+    !mustRecreateFreshNode &&
+    isRecaptchaVerifierUsable(verifierRef.current, containerEl) &&
     g &&
     typeof g.reset === 'function' &&
     typeof currentWidgetId === 'number'
@@ -201,7 +361,7 @@ export async function resetOrRecreatePhoneRecaptchaVerifierOnce(
 
   if (!resetSucceeded) {
     cleanupPhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
-    if (containerEl && document.body.contains(containerEl)) {
+    if (containerEl && typeof document !== 'undefined' && document.body.contains(containerEl)) {
       await ensurePhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
     }
   }
@@ -210,30 +370,40 @@ export async function resetOrRecreatePhoneRecaptchaVerifierOnce(
 function formatFirebasePhoneAuthError(err: any, e164Phone: string): string {
   const code = String(err?.code || '');
   const rawMessage = String(err?.message || '');
+  const { projectId, currentHostname } = getClientFirebaseProjectInfo();
 
   if (rawMessage.includes('reCAPTCHA has already been rendered')) {
-    return 'Phiên bảo mật reCAPTCHA vừa được làm mới tự động. Vui lòng bấm gửi mã OTP một lần nữa.';
+    return 'Phiên bảo mật reCAPTCHA vừa được tạo lại trên vùng chứa mới. Vui lòng bấm "Gửi mã OTP" một lần nữa.';
   }
   if (code === 'auth/operation-not-allowed') {
-    return 'Phương thức xác thực Số điện thoại (Phone) chưa được bật trên Firebase Console (Authentication → Sign-in method → Phone). Hệ thống không giả lập OTP; vui lòng bật Phone Auth hoặc chuyển sang xác minh qua Mã Gmail.';
+    return `Phương thức xác thực Số điện thoại (Phone) chưa được bật trên dự án Firebase (${projectId} → Authentication → Sign-in method → Phone). Hệ thống giữ xác minh thật, không dùng OTP giả; vui lòng bật Phone Auth hoặc chọn xác minh qua Mã Gmail.`;
   }
   if (code === 'auth/invalid-phone-number') {
     return `Số điện thoại (${e164Phone}) không hợp lệ theo chuẩn quốc tế E.164 của Firebase Auth.`;
   }
+  if (code === 'auth/missing-phone-number') {
+    return 'Thiếu số điện thoại nhận mã SMS OTP.';
+  }
   if (code === 'auth/too-many-requests' || code === 'auth/quota-exceeded') {
     return 'Số điện thoại hoặc thiết bị đã yêu cầu gửi SMS OTP quá giới hạn cho phép của Firebase. Vui lòng đợi ít phút hoặc chọn xác minh qua Mã Gmail.';
   }
-  if (code === 'auth/captcha-check-failed' || code === 'auth/unauthorized-domain') {
-    return `Xác thực reCAPTCHA không thành công hoặc tên miền hiện tại (${window.location.hostname}) chưa được thêm vào Authorized Domains trong Firebase Console (Authentication → Settings → Authorized domains).`;
+  if (code === 'auth/unauthorized-domain') {
+    return `Tên miền hiện tại (${currentHostname}) chưa được thêm vào Authorized Domains của dự án Firebase (${projectId}). Vui lòng thêm "${currentHostname}" tại Firebase Console → Authentication → Settings → Authorized domains.`;
+  }
+  if (code === 'auth/captcha-check-failed') {
+    return `Xác minh reCAPTCHA của Firebase Phone Auth không thành công trên tên miền (${currentHostname}). Hãy kiểm tra "${currentHostname}" đã có trong Authorized Domains của dự án Firebase (${projectId}) chưa, sau đó thử lại.`;
   }
   if (code === 'auth/billing-not-enabled') {
-    return 'Dự án Firebase cần bật gói Blaze (Pay-as-you-go) để gửi SMS thật hoặc thêm số điện thoại kiểm thử trong Firebase Console (Authentication → Sign-in method → Phone). Bạn cũng có thể chuyển sang xác minh bằng Mã Gmail.';
+    return `Dự án Firebase (${projectId}) cần bật gói Blaze (Pay-as-you-go) để gửi SMS thật hoặc cấu hình số điện thoại kiểm thử trong Firebase Console (Authentication → Sign-in method → Phone). Bạn cũng có thể chuyển sang xác minh bằng Mã Gmail.`;
+  }
+  if (code === 'auth/app-not-authorized') {
+    return `Ứng dụng web hiện tại trên tên miền (${currentHostname}) chưa được ủy quyền sử dụng Firebase Phone Authentication cho dự án (${projectId}).`;
   }
   if (code === 'auth/network-request-failed') {
     return 'Lỗi kết nối mạng khi liên hệ máy chủ Firebase Phone Authentication. Vui lòng kiểm tra kết nối Internet và thử lại.';
   }
   if (code === 'auth/internal-error') {
-    return 'Máy chủ Firebase Phone Authentication trả về lỗi nội bộ (auth/internal-error). Vui lòng kiểm tra cấu hình Phone Auth / Authorized Domains trên Firebase Console hoặc chọn xác minh bằng Mã Gmail.';
+    return `Máy chủ Firebase Phone Authentication trả về lỗi nội bộ (auth/internal-error) trên dự án (${projectId}). Vui lòng kiểm tra cấu hình Phone Auth & Authorized Domains (${currentHostname}) trên Firebase Console hoặc chọn xác minh bằng Mã Gmail.`;
   }
   return rawMessage || 'Không thể gửi mã OTP qua Firebase Phone Authentication.';
 }
@@ -314,7 +484,37 @@ export async function requestFirebasePhoneOtp(
       };
     }
 
-    const confirmationResult = await signInWithPhoneNumber(auth, e164Phone, verifier);
+    let confirmationResult: ConfirmationResult;
+    try {
+      confirmationResult = await signInWithPhoneNumber(auth, e164Phone, verifier);
+    } catch (firstErr: any) {
+      const firstMsg = String(firstErr?.message || '');
+      // Nếu vì bất kỳ lý do gì phiên reCAPTCHA cũ báo đã render hoặc phần tử bị tách,
+      // dọn sạch, tạo lại verifier đúng 1 lần trên phần tử DOM con mới và gửi lại ngay
+      if (
+        firstMsg.includes('already been rendered') ||
+        firstMsg.includes('client element has been removed') ||
+        firstMsg.includes('No reCAPTCHA clients exist')
+      ) {
+        cleanupPhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
+        const recreated = await ensurePhoneRecaptchaVerifier(
+          containerEl,
+          verifierRef,
+          widgetIdRef
+        );
+        if (!recreated.verifier) {
+          throw firstErr;
+        }
+        confirmationResult = await signInWithPhoneNumber(
+          auth,
+          e164Phone,
+          recreated.verifier
+        );
+      } else {
+        throw firstErr;
+      }
+    }
+
     if (!confirmationResult || typeof confirmationResult.confirm !== 'function') {
       await resetOrRecreatePhoneRecaptchaVerifierOnce(containerEl, verifierRef, widgetIdRef);
       return {
@@ -329,16 +529,12 @@ export async function requestFirebasePhoneOtp(
     return { sent: true, e164Phone };
   } catch (err: any) {
     activePhoneConfirmationResult = null;
-    // Nếu gặp lỗi "reCAPTCHA has already been rendered", buộc tạo lại verifier trên node con mới đúng 1 lần
-    const rawMsg = String(err?.message || '');
-    if (rawMsg.includes('reCAPTCHA has already been rendered')) {
-      cleanupPhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
-      if (containerEl && document.body.contains(containerEl)) {
-        await ensurePhoneRecaptchaVerifier(containerEl, verifierRef, widgetIdRef);
-      }
-    } else {
-      await resetOrRecreatePhoneRecaptchaVerifierOnce(containerEl, verifierRef, widgetIdRef);
-    }
+    await resetOrRecreatePhoneRecaptchaVerifierOnce(
+      containerEl,
+      verifierRef,
+      widgetIdRef,
+      err
+    );
 
     return {
       sent: false,
