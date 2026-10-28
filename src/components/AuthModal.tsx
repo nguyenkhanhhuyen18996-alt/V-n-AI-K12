@@ -18,7 +18,8 @@ import {
   sendTeacherGmailOtp,
   verifyTeacherGmailOtp,
   verifyTeacherPhoneOtp,
-  fetchTeacherRegistrationStatus
+  fetchTeacherRegistrationStatus,
+  checkTeacherEmailConfigOnServer
 } from '../services/accountService';
 import {
   auth,
@@ -381,7 +382,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       }
       const serverRes = await verifyTeacherPhoneOtp(
         activeRegistration.id,
-        confirmRes.idToken
+        confirmRes.idToken,
+        activeRegistration.registrationStateToken
       );
       if (serverRes.success && serverRes.registration) {
         setActiveRegistration(serverRes.registration);
@@ -398,7 +400,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
-  // Gửi mã xác minh đến Gmail qua dịch vụ phía máy chủ
+  // Gửi mã xác minh đến Gmail qua dịch vụ SMTP/Email phía máy chủ
   const handleSendGmailOtp = async () => {
     if (!activeRegistration || isLoading || isOtpSubmittingRef.current) return;
     isOtpSubmittingRef.current = true;
@@ -407,12 +409,29 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setSuccessMessage(null);
     setIsLoading(true);
     try {
-      const res = await sendTeacherGmailOtp(activeRegistration.id);
+      const res = await sendTeacherGmailOtp(
+        activeRegistration.id,
+        activeRegistration.registrationStateToken
+      );
       if (res.success) {
         setGmailOtpSent(true);
+        if (res.providerName) {
+          setEmailProviderStatus({
+            configured: true,
+            providerName: res.providerName,
+            missingEnvVars: []
+          });
+        }
         setSuccessMessage(res.message);
       } else {
         setGmailOtpSent(false);
+        if (res.providerConfigured === false && Array.isArray(res.missingEnvVars)) {
+          setEmailProviderStatus({
+            configured: false,
+            providerName: res.providerName || 'Chưa cấu hình dịch vụ gửi mail phía máy chủ',
+            missingEnvVars: res.missingEnvVars
+          });
+        }
         setErrorMessage(res.message);
       }
     } catch (err: any) {
@@ -434,7 +453,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setSuccessMessage(null);
     setIsLoading(true);
     try {
-      const res = await verifyTeacherGmailOtp(activeRegistration.id, otpInputCode);
+      const res = await verifyTeacherGmailOtp(
+        activeRegistration.id,
+        otpInputCode,
+        activeRegistration.registrationStateToken
+      );
       if (res.success && res.registration) {
         setActiveRegistration(res.registration);
         setOtpInputCode('');
@@ -1312,6 +1335,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                               setVerificationMethod('gmail_otp');
                               setErrorMessage(null);
                               setSuccessMessage(null);
+                              checkTeacherEmailConfigOnServer()
+                                .then((cfg) => {
+                                  setEmailProviderStatus({
+                                    configured: cfg.ready,
+                                    providerName: cfg.providerName,
+                                    missingEnvVars: cfg.missingEnvVars || []
+                                  });
+                                })
+                                .catch(() => {});
                             }}
                             className={`px-2.5 py-1 rounded text-[11px] font-bold cursor-pointer disabled:opacity-50 ${
                               verificationMethod === 'gmail_otp'

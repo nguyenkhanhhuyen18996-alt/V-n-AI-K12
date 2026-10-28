@@ -1214,7 +1214,9 @@ function resolveSmtpAndEmailEnv() {
   );
   const smtpHost =
     rawHost || (smtpUser.toLowerCase().endsWith('@gmail.com') ? 'smtp.gmail.com' : '');
-  const isGmailSmtp = smtpHost.toLowerCase().includes('gmail.com');
+  const isGmailSmtp =
+    smtpHost.toLowerCase().includes('gmail.com') ||
+    /^[a-z0-9]{4}(\s+[a-z0-9]{4}){3}$/i.test(rawPass);
   const smtpPass = isGmailSmtp ? rawPass.replace(/\s+/g, '') : rawPass;
 
   const rawPort = Number(

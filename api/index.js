@@ -1,6 +1,8 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import tls from "tls";
+import net from "net";
 
 let express = null;
 let nodemailer = null;
@@ -990,8 +992,7 @@ function resolveSmtpAndEmailEnv() {
   }
 
   if (
-    smtpHost &&
-    smtpHost.toLowerCase().includes("gmail.com") &&
+    (smtpHost && smtpHost.toLowerCase().includes("gmail.com")) ||
     /^[a-z0-9]{4}(\s+[a-z0-9]{4}){3}$/i.test(smtpPass)
   ) {
     smtpPass = smtpPass.replace(/\s+/g, "");
@@ -1101,6 +1102,186 @@ function getEmailProviderStatus() {
   };
 }
 
+function extractEmailAddressOnly(addrStr) {
+  const m = String(addrStr || "").match(/<([^>]+)>/);
+  return (m ? m[1] : String(addrStr || "")).trim();
+}
+
+function executeNativeSmtpSession(env, mailOptions = null) {
+  return new Promise((resolve, reject) => {
+    let socket = null;
+    let settled = false;
+    let buffer = "";
+    let step = "GREETING";
+    const timeoutMs = 12000;
+
+    const finish = (err, resVal) => {
+      if (settled) return;
+      settled = true;
+      try {
+        if (socket && !socket.destroyed) {
+          socket.end();
+          socket.destroy();
+        }
+      } catch {}
+      if (err) reject(err);
+      else resolve(resVal);
+    };
+
+    const timer = setTimeout(() => {
+      const err = new Error(`Hết thời gian chờ kết nối tới máy chủ SMTP (${env.smtpHost}:${env.smtpPort}).`);
+      err.code = "ETIMEDOUT";
+      finish(err);
+    }, timeoutMs);
+
+    const clearTimerAndFinish = (err, resVal) => {
+      clearTimeout(timer);
+      finish(err, resVal);
+    };
+
+    const sendLine = (line) => {
+      socket.write(line + "\r\n");
+    };
+
+    const handleResponse = (code, fullText) => {
+      if (code >= 400) {
+        const err = new Error(fullText.trim());
+        err.responseCode = code;
+        if (code === 535 || code === 534 || step.startsWith("AUTH")) {
+          err.code = "EAUTH";
+        } else if (code === 550 || code === 553) {
+          err.code = "EENVELOPE";
+        }
+        clearTimerAndFinish(err);
+        return;
+      }
+
+      if (step === "GREETING") {
+        step = "EHLO";
+        sendLine("EHLO vanai12.local");
+      } else if (step === "EHLO") {
+        if (!env.smtpSecure && (env.smtpPort === 587 || fullText.includes("STARTTLS"))) {
+          step = "STARTTLS";
+          sendLine("STARTTLS");
+        } else {
+          step = "AUTH_INIT";
+          sendLine("AUTH LOGIN");
+        }
+      } else if (step === "STARTTLS") {
+        socket.removeAllListeners("data");
+        const tlsSocket = tls.connect(
+          {
+            socket,
+            servername: env.smtpHost,
+            rejectUnauthorized: false
+          },
+          () => {
+            socket = tlsSocket;
+            attachListeners(socket);
+            step = "EHLO_TLS";
+            sendLine("EHLO vanai12.local");
+          }
+        );
+        tlsSocket.on("error", (err) => clearTimerAndFinish(err));
+      } else if (step === "EHLO_TLS") {
+        step = "AUTH_INIT";
+        sendLine("AUTH LOGIN");
+      } else if (step === "AUTH_INIT") {
+        step = "AUTH_USER";
+        sendLine(Buffer.from(env.smtpUser, "utf-8").toString("base64"));
+      } else if (step === "AUTH_USER") {
+        step = "AUTH_PASS";
+        sendLine(Buffer.from(env.smtpPass, "utf-8").toString("base64"));
+      } else if (step === "AUTH_PASS") {
+        if (!mailOptions) {
+          step = "QUIT";
+          sendLine("QUIT");
+          clearTimerAndFinish(null, { verified: true });
+          return;
+        }
+        step = "MAIL_FROM";
+        const fromEmail = extractEmailAddressOnly(mailOptions.from || env.smtpUser);
+        sendLine(`MAIL FROM:<${fromEmail}>`);
+      } else if (step === "MAIL_FROM") {
+        step = "RCPT_TO";
+        const toEmail = extractEmailAddressOnly(mailOptions.to);
+        sendLine(`RCPT TO:<${toEmail}>`);
+      } else if (step === "RCPT_TO") {
+        step = "DATA_INIT";
+        sendLine("DATA");
+      } else if (step === "DATA_INIT") {
+        step = "DATA_BODY";
+        const subjB64 = Buffer.from(mailOptions.subject || "", "utf-8").toString("base64");
+        const bodyB64 = Buffer.from(mailOptions.text || "", "utf-8")
+          .toString("base64")
+          .replace(/(.{76})/g, "$1\r\n");
+        const mimeMsg = [
+          `From: ${mailOptions.from}`,
+          `To: <${extractEmailAddressOnly(mailOptions.to)}>`,
+          `Subject: =?UTF-8?B?${subjB64}?=`,
+          `Date: ${new Date().toUTCString()}`,
+          `MIME-Version: 1.0`,
+          `Content-Type: text/plain; charset=UTF-8`,
+          `Content-Transfer-Encoding: base64`,
+          ``,
+          bodyB64,
+          `.`
+        ].join("\r\n");
+        sendLine(mimeMsg);
+      } else if (step === "DATA_BODY") {
+        step = "QUIT";
+        sendLine("QUIT");
+        clearTimerAndFinish(null, { sent: true });
+      }
+    };
+
+    const attachListeners = (sock) => {
+      sock.on("data", (chunk) => {
+        buffer += chunk.toString("utf-8");
+        const lines = buffer.split("\r\n");
+        buffer = lines.pop() || "";
+        let collected = [];
+        for (const line of lines) {
+          if (!line) continue;
+          collected.push(line);
+          if (/^\d{3}\s/.test(line)) {
+            const code = Number(line.slice(0, 3));
+            const fullText = collected.join("\n");
+            collected = [];
+            handleResponse(code, fullText);
+          }
+        }
+      });
+      sock.on("error", (err) => clearTimerAndFinish(err));
+      sock.on("close", () => {
+        if (!settled) {
+          const err = new Error("Kết nối SMTP bị đóng đột ngột trước khi hoàn tất.");
+          err.code = "ECONNECTION";
+          clearTimerAndFinish(err);
+        }
+      });
+    };
+
+    try {
+      if (env.smtpSecure) {
+        socket = tls.connect({
+          host: env.smtpHost,
+          port: env.smtpPort,
+          servername: env.smtpHost
+        });
+      } else {
+        socket = net.connect({
+          host: env.smtpHost,
+          port: env.smtpPort
+        });
+      }
+      attachListeners(socket);
+    } catch (err) {
+      clearTimerAndFinish(err);
+    }
+  });
+}
+
 async function verifyEmailProviderConnectionOnServer() {
   const status = getEmailProviderStatus();
   const env = resolveSmtpAndEmailEnv();
@@ -1135,20 +1316,24 @@ async function verifyEmailProviderConnectionOnServer() {
   if (status.mode === "smtp") {
     try {
       if (!nodemailer) await ensureFullApiDepsLoaded();
-      const transporter = nodemailer.createTransport({
-        host: env.smtpHost,
-        port: env.smtpPort,
-        secure: env.smtpSecure,
-        requireTLS: !env.smtpSecure && env.smtpPort === 587,
-        auth: {
-          user: env.smtpUser,
-          pass: env.smtpPass
-        },
-        connectionTimeout: 10000,
-        greetingTimeout: 10000,
-        socketTimeout: 12000
-      });
-      await transporter.verify();
+      if (nodemailer && typeof nodemailer.createTransport === "function") {
+        const transporter = nodemailer.createTransport({
+          host: env.smtpHost,
+          port: env.smtpPort,
+          secure: env.smtpSecure,
+          requireTLS: !env.smtpSecure && env.smtpPort === 587,
+          auth: {
+            user: env.smtpUser,
+            pass: env.smtpPass
+          },
+          connectionTimeout: 10000,
+          greetingTimeout: 10000,
+          socketTimeout: 12000
+        });
+        await transporter.verify();
+      } else {
+        await executeNativeSmtpSession(env, null);
+      }
       return {
         ready: true,
         mode: "smtp",
@@ -1226,25 +1411,34 @@ async function sendGmailVerificationCodeViaServer(recipientGmail, fullName, otpC
     const fromAddr = env.emailFrom || `VanAI 12 <${env.smtpUser}>`;
     try {
       if (!nodemailer) await ensureFullApiDepsLoaded();
-      const transporter = nodemailer.createTransport({
-        host: env.smtpHost,
-        port: env.smtpPort,
-        secure: env.smtpSecure,
-        requireTLS: !env.smtpSecure && env.smtpPort === 587,
-        auth: {
-          user: env.smtpUser,
-          pass: env.smtpPass
-        },
-        connectionTimeout: 10000,
-        greetingTimeout: 10000,
-        socketTimeout: 12000
-      });
-      await transporter.sendMail({
-        from: fromAddr,
-        to: recipientGmail,
-        subject,
-        text: textBody
-      });
+      if (nodemailer && typeof nodemailer.createTransport === "function") {
+        const transporter = nodemailer.createTransport({
+          host: env.smtpHost,
+          port: env.smtpPort,
+          secure: env.smtpSecure,
+          requireTLS: !env.smtpSecure && env.smtpPort === 587,
+          auth: {
+            user: env.smtpUser,
+            pass: env.smtpPass
+          },
+          connectionTimeout: 10000,
+          greetingTimeout: 10000,
+          socketTimeout: 12000
+        });
+        await transporter.sendMail({
+          from: fromAddr,
+          to: recipientGmail,
+          subject,
+          text: textBody
+        });
+      } else {
+        await executeNativeSmtpSession(env, {
+          from: fromAddr,
+          to: recipientGmail,
+          subject,
+          text: textBody
+        });
+      }
       return { sent: true };
     } catch (err) {
       return {
@@ -4444,6 +4638,489 @@ async function handleDirectAuthEndpoint(req, res, pathname) {
     }
   }
 
+  // 4. GET /api/teacher-registration/email-config-check
+  if (pathname === "/api/teacher-registration/email-config-check") {
+    const check = await verifyEmailProviderConnectionOnServer();
+    sendJsonResponse(res, check.ready ? 200 : 503, {
+      ready: check.ready,
+      mode: check.mode,
+      providerName: check.providerName,
+      missingEnvVars: check.missingEnvVars || [],
+      message: check.ready
+        ? `Dịch vụ gửi mã OTP Gmail (${check.providerName}) đã sẵn sàng.`
+        : check.error
+    });
+    return true;
+  }
+
+  // 5. POST /api/teacher-registration/submit
+  if (pathname === "/api/teacher-registration/submit" && method === "POST") {
+    const body = await parseJsonRequestBody(req);
+    const { username, fullName, phone, gmail, password, verificationMethod } = body || {};
+    if (!fullName || !phone || !gmail || !password) {
+      sendJsonResponse(res, 400, {
+        success: false,
+        message: "Vui lòng nhập đầy đủ Họ tên, Số điện thoại, địa chỉ Gmail và Mật khẩu tài khoản."
+      });
+      return true;
+    }
+    if (String(password).length < 6) {
+      sendJsonResponse(res, 400, {
+        success: false,
+        message: "Mật khẩu tài khoản phải có tối thiểu 6 ký tự."
+      });
+      return true;
+    }
+    if (!isValidPhoneFormat(String(phone))) {
+      sendJsonResponse(res, 400, {
+        success: false,
+        message: "Số điện thoại không hợp lệ (VD: 0912345678 hoặc +84912345678)."
+      });
+      return true;
+    }
+    const normalizedGmail = String(gmail).trim().toLowerCase();
+    if (!isValidGmailFormat(normalizedGmail)) {
+      sendJsonResponse(res, 400, {
+        success: false,
+        message: "Địa chỉ Gmail không hợp lệ."
+      });
+      return true;
+    }
+
+    const normalizedPhone = normalizePhoneE164(String(phone));
+    const methodChoice = verificationMethod === "gmail_otp" ? "gmail_otp" : "phone_otp";
+    const accounts = loadServerAccounts();
+    const registrations = loadTeacherRegistrations();
+    const classes = loadServerClasses();
+    const desiredUsername = username
+      ? String(username).trim().toUpperCase()
+      : `GV-${normalizedPhone.slice(-6)}`;
+
+    const existingReg = registrations.find(
+      (r) =>
+        r.gmail.toLowerCase() === normalizedGmail ||
+        normalizePhoneE164(r.phone) === normalizedPhone ||
+        r.username.toUpperCase() === desiredUsername
+    );
+    if (existingReg) {
+      if (existingReg.approvalStatus === "approved") {
+        sendJsonResponse(res, 409, {
+          success: false,
+          message: "Giáo viên với số điện thoại, Gmail hoặc mã tài khoản này đã được duyệt. Vui lòng đăng nhập."
+        });
+        return true;
+      }
+      existingReg.fullName = String(fullName).trim();
+      existingReg.phone = normalizedPhone;
+      existingReg.gmail = normalizedGmail;
+      existingReg.verificationMethod = methodChoice;
+      existingReg.updatedAt = new Date().toISOString();
+      const linkedAcc = accounts.find((a) => a.id === existingReg.teacherUid);
+      if (linkedAcc) {
+        const salt2 = generateSaltServer();
+        linkedAcc.fullName = existingReg.fullName;
+        linkedAcc.phone = normalizedPhone;
+        linkedAcc.email = normalizedGmail;
+        linkedAcc.verificationMethod = methodChoice;
+        linkedAcc.passwordSalt = salt2;
+        linkedAcc.passwordHash = hashPasswordServer(String(password), salt2);
+        saveServerAccounts(accounts);
+      }
+      saveTeacherRegistrations(registrations);
+      const sanitizedExisting = sanitizeRegistrationForClient(existingReg, classes, accounts);
+      sendJsonResponse(res, 200, {
+        success: true,
+        registration: sanitizedExisting,
+        registrationStateToken: sanitizedExisting.registrationStateToken,
+        emailProviderStatus: getEmailProviderStatus(),
+        message: existingReg.isOwnershipVerified
+          ? "Yêu cầu của bạn đã xác minh quyền sở hữu và đang chờ Quản trị viên duyệt."
+          : "Đã cập nhật thông tin đăng ký. Vui lòng hoàn tất bước xác minh mã OTP."
+      });
+      return true;
+    }
+
+    if (accounts.some((a) => a.username.toUpperCase() === desiredUsername)) {
+      sendJsonResponse(res, 409, {
+        success: false,
+        message: `Mã tài khoản "${desiredUsername}" đã tồn tại trong hệ thống.`
+      });
+      return true;
+    }
+
+    const salt = generateSaltServer();
+    const teacherUid = `teacher-${crypto.randomUUID()}`;
+    const registrationId = `treg-${crypto.randomUUID()}`;
+    const now = new Date().toISOString();
+
+    const newTeacherAccount = {
+      id: teacherUid,
+      username: desiredUsername,
+      fullName: String(fullName).trim(),
+      role: "teacher",
+      email: normalizedGmail,
+      phone: normalizedPhone,
+      verificationMethod: methodChoice,
+      phoneVerified: false,
+      gmailVerified: false,
+      teacherApprovalStatus: "pending_verification",
+      isActivated: true,
+      passwordSalt: salt,
+      passwordHash: hashPasswordServer(String(password), salt),
+      createdAt: now,
+      status: "pending_activation",
+      notes: "Đăng ký Giáo viên — Chờ xác minh OTP và Quản trị viên duyệt"
+    };
+
+    const newRegistration = {
+      id: registrationId,
+      teacherUid,
+      username: desiredUsername,
+      fullName: String(fullName).trim(),
+      phone: normalizedPhone,
+      gmail: normalizedGmail,
+      verificationMethod: methodChoice,
+      phoneVerified: false,
+      gmailVerified: false,
+      isOwnershipVerified: false,
+      approvalStatus: "pending_verification",
+      createdAt: now,
+      updatedAt: now
+    };
+
+    accounts.push(newTeacherAccount);
+    registrations.unshift(newRegistration);
+    saveServerAccounts(accounts);
+    saveTeacherRegistrations(registrations);
+
+    const sanitizedNew = sanitizeRegistrationForClient(newRegistration, classes, accounts);
+    sendJsonResponse(res, 200, {
+      success: true,
+      registration: sanitizedNew,
+      registrationStateToken: sanitizedNew.registrationStateToken,
+      emailProviderStatus: getEmailProviderStatus(),
+      message:
+        "Đã ghi nhận hồ sơ đăng ký Giáo viên. Vui lòng xác minh quyền sở hữu Số điện thoại hoặc Gmail để chuyển sang danh sách chờ Quản trị viên duyệt."
+    });
+    return true;
+  }
+
+  // 6. POST /api/teacher-registration/send-gmail-otp
+  if (pathname === "/api/teacher-registration/send-gmail-otp" && method === "POST") {
+    const body = await parseJsonRequestBody(req);
+    const { registrationId, registrationStateToken } = body || {};
+    if (!registrationId) {
+      sendJsonResponse(res, 400, {
+        success: false,
+        message: "Thiếu mã hồ sơ đăng ký (registrationId)."
+      });
+      return true;
+    }
+
+    const registrations = loadTeacherRegistrations();
+    const accounts = loadServerAccounts();
+    let reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
+    if (!reg && registrationStateToken) {
+      reg = hydrateTeacherRegistrationFromStateToken(
+        String(registrationStateToken),
+        registrations,
+        accounts
+      );
+    }
+    if (!reg) {
+      sendJsonResponse(res, 404, {
+        success: false,
+        message: "Không tìm thấy hồ sơ đăng ký giáo viên. Vui lòng gửi lại biểu mẫu đăng ký."
+      });
+      return true;
+    }
+
+    if (reg.lastOtpSentAt) {
+      const elapsedMs = Date.now() - new Date(reg.lastOtpSentAt).getTime();
+      if (elapsedMs < 20000 && !process.env.SMTP_TEST_OUTBOX_FILE) {
+        const waitSec = Math.ceil((20000 - elapsedMs) / 1000);
+        sendJsonResponse(res, 429, {
+          success: false,
+          message: `Vui lòng đợi ${waitSec} giây trước khi yêu cầu gửi lại mã xác minh Gmail.`
+        });
+        return true;
+      }
+    }
+
+    const providerStatus = getEmailProviderStatus();
+    if (!providerStatus.configured) {
+      sendJsonResponse(res, 503, {
+        success: false,
+        providerConfigured: false,
+        providerName: providerStatus.providerName,
+        missingEnvVars: providerStatus.missingEnvVars,
+        message: `Chưa thể gửi mã xác minh đến Gmail (${reg.gmail}) vì máy chủ thiếu cấu hình dịch vụ gửi email (${providerStatus.missingEnvVars.join(", ")}). Hệ thống không tạo mã giả lập và không tự động xác minh. Vui lòng cấu hình biến môi trường gửi mail trên máy chủ hoặc chọn xác minh qua OTP Số điện thoại (Firebase Phone Auth).`
+      });
+      return true;
+    }
+
+    const otpCode = crypto.randomInt(100000, 999999).toString();
+    const otpSalt = generateSaltServer();
+    const otpHash = hashOtpCodeServer(otpCode, otpSalt);
+
+    const delivery = await sendGmailVerificationCodeViaServer(reg.gmail, reg.fullName, otpCode);
+    if (!delivery.sent) {
+      sendJsonResponse(res, 503, {
+        success: false,
+        providerConfigured: false,
+        providerName: providerStatus.providerName,
+        missingEnvVars: providerStatus.missingEnvVars,
+        message: delivery.error || "Không thể gửi email xác minh qua dịch vụ máy chủ."
+      });
+      return true;
+    }
+
+    reg.verificationMethod = "gmail_otp";
+    reg.gmailOtpSalt = otpSalt;
+    reg.gmailOtpHash = otpHash;
+    reg.gmailOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    reg.gmailOtpAttempts = 0;
+    reg.lastOtpSentAt = new Date().toISOString();
+    reg.updatedAt = new Date().toISOString();
+    saveTeacherRegistrations(registrations);
+
+    const linkedAccount = accounts.find((a) => a.id === reg.teacherUid);
+    const updatedStateToken = encodeTeacherRegistrationStateToken(reg, linkedAccount);
+
+    sendJsonResponse(res, 200, {
+      success: true,
+      providerConfigured: true,
+      providerName: providerStatus.providerName,
+      expiresAt: reg.gmailOtpExpiresAt,
+      registrationStateToken: updatedStateToken,
+      message: `Đã gửi mã xác minh 6 chữ số tới địa chỉ Gmail ${reg.gmail}. Mã có hiệu lực trong 10 phút.`
+    });
+    return true;
+  }
+
+  // 7. POST /api/teacher-registration/verify-gmail-otp
+  if (pathname === "/api/teacher-registration/verify-gmail-otp" && method === "POST") {
+    const body = await parseJsonRequestBody(req);
+    const { registrationId, otpCode, registrationStateToken } = body || {};
+    if (!registrationId || !otpCode) {
+      sendJsonResponse(res, 400, {
+        success: false,
+        message: "Vui lòng nhập đầy đủ mã hồ sơ đăng ký và mã xác minh Gmail 6 chữ số."
+      });
+      return true;
+    }
+
+    const registrations = loadTeacherRegistrations();
+    const accounts = loadServerAccounts();
+    const classes = loadServerClasses();
+    if (registrationStateToken) {
+      hydrateTeacherRegistrationFromStateToken(
+        String(registrationStateToken),
+        registrations,
+        accounts
+      );
+    }
+    const reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
+    if (!reg) {
+      sendJsonResponse(res, 404, {
+        success: false,
+        message: "Không tìm thấy hồ sơ đăng ký giáo viên. Vui lòng gửi lại biểu mẫu đăng ký."
+      });
+      return true;
+    }
+
+    if (!reg.gmailOtpHash || !reg.gmailOtpSalt || !reg.gmailOtpExpiresAt) {
+      sendJsonResponse(res, 400, {
+        success: false,
+        message: 'Chưa có mã xác minh Gmail nào được phát hành hoặc mã đã bị hủy. Vui lòng bấm "Gửi mã xác minh Gmail".'
+      });
+      return true;
+    }
+
+    if ((reg.gmailOtpAttempts || 0) >= 5) {
+      sendJsonResponse(res, 429, {
+        success: false,
+        message: "Bạn đã nhập sai mã xác minh quá 5 lần. Vui lòng yêu cầu gửi lại mã mới."
+      });
+      return true;
+    }
+
+    if (Date.now() > new Date(reg.gmailOtpExpiresAt).getTime()) {
+      sendJsonResponse(res, 401, {
+        success: false,
+        message: "Mã xác minh Gmail đã hết hạn. Vui lòng yêu cầu gửi lại mã mới."
+      });
+      return true;
+    }
+
+    reg.gmailOtpAttempts = (reg.gmailOtpAttempts || 0) + 1;
+    const candidateHash = hashOtpCodeServer(String(otpCode).trim(), reg.gmailOtpSalt);
+    const isMatch =
+      candidateHash.length === reg.gmailOtpHash.length &&
+      crypto.timingSafeEqual(Buffer.from(candidateHash), Buffer.from(reg.gmailOtpHash));
+
+    if (!isMatch) {
+      saveTeacherRegistrations(registrations);
+      const linkedAccount = accounts.find((a) => a.id === reg.teacherUid);
+      sendJsonResponse(res, 401, {
+        success: false,
+        remainingAttempts: Math.max(0, 5 - reg.gmailOtpAttempts),
+        registrationStateToken: encodeTeacherRegistrationStateToken(reg, linkedAccount),
+        message: `Mã xác minh Gmail không chính xác. Còn ${Math.max(0, 5 - reg.gmailOtpAttempts)} lần thử.`
+      });
+      return true;
+    }
+
+    const now = new Date().toISOString();
+    reg.gmailVerified = true;
+    reg.gmailVerifiedAt = now;
+    reg.isOwnershipVerified = true;
+    reg.verificationMethod = "gmail_otp";
+    reg.gmailOtpHash = undefined;
+    reg.gmailOtpSalt = undefined;
+    reg.gmailOtpExpiresAt = undefined;
+    reg.gmailOtpAttempts = 0;
+    if (reg.approvalStatus === "pending_verification") {
+      reg.approvalStatus = "pending_admin_approval";
+    }
+    reg.updatedAt = now;
+
+    const teacherAcc = accounts.find((a) => a.id === reg.teacherUid);
+    if (teacherAcc) {
+      teacherAcc.gmailVerified = true;
+      teacherAcc.verificationMethod = "gmail_otp";
+      if (teacherAcc.teacherApprovalStatus === "pending_verification") {
+        teacherAcc.teacherApprovalStatus = "pending_admin_approval";
+      }
+      saveServerAccounts(accounts);
+    }
+    saveTeacherRegistrations(registrations);
+
+    const sanitizedReg = sanitizeRegistrationForClient(reg, classes, accounts);
+    sendJsonResponse(res, 200, {
+      success: true,
+      registration: sanitizedReg,
+      registrationStateToken: sanitizedReg.registrationStateToken,
+      message: 'Xác minh quyền sở hữu Gmail thành công! Yêu cầu đăng ký của bạn đã chuyển sang trạng thái "Chờ quản trị viên duyệt".'
+    });
+    return true;
+  }
+
+  // 8. POST /api/teacher-registration/verify-phone-otp
+  if (pathname === "/api/teacher-registration/verify-phone-otp" && method === "POST") {
+    const body = await parseJsonRequestBody(req);
+    const { registrationId, firebaseIdToken, registrationStateToken } = body || {};
+    if (!registrationId || !firebaseIdToken) {
+      sendJsonResponse(res, 400, {
+        success: false,
+        message: "Thiếu mã hồ sơ đăng ký hoặc token xác thực Firebase Phone Authentication."
+      });
+      return true;
+    }
+
+    const registrations = loadTeacherRegistrations();
+    const accounts = loadServerAccounts();
+    const classes = loadServerClasses();
+    if (registrationStateToken) {
+      hydrateTeacherRegistrationFromStateToken(
+        String(registrationStateToken),
+        registrations,
+        accounts
+      );
+    }
+    const reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
+    if (!reg) {
+      sendJsonResponse(res, 404, {
+        success: false,
+        message: "Không tìm thấy hồ sơ đăng ký giáo viên. Vui lòng gửi lại biểu mẫu đăng ký."
+      });
+      return true;
+    }
+
+    const verification = await verifyFirebasePhoneIdTokenOnServer(
+      String(firebaseIdToken),
+      reg.phone
+    );
+    if (!verification.verified) {
+      sendJsonResponse(res, 401, {
+        success: false,
+        message:
+          verification.error ||
+          "Xác minh OTP Số điện thoại không thành công. Hệ thống không chấp nhận xác minh giả lập."
+      });
+      return true;
+    }
+
+    const now = new Date().toISOString();
+    reg.phoneVerified = true;
+    reg.phoneVerifiedAt = now;
+    reg.isOwnershipVerified = true;
+    reg.verificationMethod = "phone_otp";
+    if (reg.approvalStatus === "pending_verification") {
+      reg.approvalStatus = "pending_admin_approval";
+    }
+    reg.updatedAt = now;
+
+    const teacherAcc = accounts.find((a) => a.id === reg.teacherUid);
+    if (teacherAcc) {
+      teacherAcc.phoneVerified = true;
+      teacherAcc.verificationMethod = "phone_otp";
+      if (teacherAcc.teacherApprovalStatus === "pending_verification") {
+        teacherAcc.teacherApprovalStatus = "pending_admin_approval";
+      }
+      saveServerAccounts(accounts);
+    }
+    saveTeacherRegistrations(registrations);
+
+    const sanitizedReg = sanitizeRegistrationForClient(reg, classes, accounts);
+    sendJsonResponse(res, 200, {
+      success: true,
+      registration: sanitizedReg,
+      registrationStateToken: sanitizedReg.registrationStateToken,
+      message: 'Xác minh OTP Số điện thoại qua Firebase Phone Auth thành công! Yêu cầu của bạn đã chuyển sang trạng thái "Chờ quản trị viên duyệt".'
+    });
+    return true;
+  }
+
+  // 9. GET /api/teacher-registration/status/:identifier
+  if (pathname.startsWith("/api/teacher-registration/status/") && method === "GET") {
+    const rawIdentifier = pathname.slice("/api/teacher-registration/status/".length);
+    const identifier = decodeURIComponent(rawIdentifier || "").trim().toLowerCase();
+    const urlParts = String(req.url || "").split("?");
+    const searchParams = new URLSearchParams(urlParts[1] || "");
+    const stateToken = String(req.query?.stateToken || searchParams.get("stateToken") || "").trim();
+
+    const registrations = loadTeacherRegistrations();
+    const classes = loadServerClasses();
+    const accounts = loadServerAccounts();
+    if (stateToken) {
+      hydrateTeacherRegistrationFromStateToken(stateToken, registrations, accounts);
+    }
+    const reg = registrations.find(
+      (r) =>
+        r.id.toLowerCase() === identifier ||
+        r.teacherUid.toLowerCase() === identifier ||
+        r.username.toLowerCase() === identifier ||
+        r.gmail.toLowerCase() === identifier ||
+        normalizePhoneE164(r.phone).toLowerCase() === normalizePhoneE164(identifier).toLowerCase()
+    );
+    if (!reg) {
+      sendJsonResponse(res, 404, {
+        found: false,
+        message: "Không tìm thấy hồ sơ đăng ký giáo viên."
+      });
+      return true;
+    }
+    const sanitizedReg = sanitizeRegistrationForClient(reg, classes, accounts);
+    sendJsonResponse(res, 200, {
+      found: true,
+      registration: sanitizedReg,
+      registrationStateToken: sanitizedReg.registrationStateToken,
+      emailProviderStatus: getEmailProviderStatus()
+    });
+    return true;
+  }
+
   return false;
 }
 
@@ -4451,7 +5128,9 @@ export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   try {
     const rawUrl = String(req.url || "/");
-    const queryPath = req?.query?.path;
+    const urlParts = rawUrl.split("?");
+    const searchParams = new URLSearchParams(urlParts[1] || "");
+    const queryPath = req?.query?.path || searchParams.get("path");
 
     if (
       (rawUrl === "/api" || rawUrl.startsWith("/api?")) &&
@@ -4460,8 +5139,6 @@ export default async function handler(req, res) {
     ) {
       const joinedPath = Array.isArray(queryPath) ? queryPath.join("/") : queryPath;
       const cleanSubPath = joinedPath.replace(/^\/+/, "");
-      const urlParts = rawUrl.split("?");
-      const searchParams = new URLSearchParams(urlParts[1] || "");
       searchParams.delete("path");
       const qs = searchParams.toString();
       req.url = `/api/${cleanSubPath}${qs ? `?${qs}` : ""}`;
@@ -4471,10 +5148,14 @@ export default async function handler(req, res) {
 
     const pathname = String(req.url || "/").split("?")[0].replace(/\/+$/, "") || "/api";
 
-    // Xử lý trực tiếp các endpoint xác thực/cấu hình quản trị viên (không phụ thuộc Express hay các module phụ)
+    // Xử lý trực tiếp các endpoint xác thực/đăng ký giáo viên/OTP (không phụ thuộc Express hay các module phụ)
     const handledDirectly = await handleDirectAuthEndpoint(req, res, pathname);
     if (handledDirectly) {
       return;
+    }
+
+    if (req.method === "POST" || req.method === "PUT" || req.method === "PATCH") {
+      req.body = await parseJsonRequestBody(req);
     }
 
     await ensureFullApiDepsLoaded();

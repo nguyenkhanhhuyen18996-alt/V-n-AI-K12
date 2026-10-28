@@ -410,8 +410,9 @@ export async function submitTeacherRegistration(payload: {
   }
 
   const data = result.data;
-  if (data.registrationStateToken) {
-    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  const stateToken = data.registrationStateToken || data.registration?.registrationStateToken;
+  if (stateToken) {
+    saveTeacherRegistrationStateToken(stateToken);
   }
 
   return {
@@ -425,7 +426,10 @@ export async function submitTeacherRegistration(payload: {
   };
 }
 
-export async function sendTeacherGmailOtp(registrationId: string): Promise<{
+export async function sendTeacherGmailOtp(
+  registrationId: string,
+  explicitStateToken?: string
+): Promise<{
   success: boolean;
   providerConfigured?: boolean;
   providerName?: string;
@@ -433,7 +437,7 @@ export async function sendTeacherGmailOtp(registrationId: string): Promise<{
   expiresAt?: string;
   message: string;
 }> {
-  const registrationStateToken = getTeacherRegistrationStateToken();
+  const registrationStateToken = explicitStateToken || getTeacherRegistrationStateToken();
   const result = await safeFetchJson<any>('/api/teacher-registration/send-gmail-otp', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -451,8 +455,9 @@ export async function sendTeacherGmailOtp(registrationId: string): Promise<{
   }
 
   const data = result.data;
-  if (data.registrationStateToken) {
-    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  const nextStateToken = data.registrationStateToken || data.registration?.registrationStateToken;
+  if (nextStateToken) {
+    saveTeacherRegistrationStateToken(nextStateToken);
   }
 
   return {
@@ -470,13 +475,14 @@ export async function sendTeacherGmailOtp(registrationId: string): Promise<{
 
 export async function verifyTeacherGmailOtp(
   registrationId: string,
-  otpCode: string
+  otpCode: string,
+  explicitStateToken?: string
 ): Promise<{
   success: boolean;
   registration?: TeacherRegistrationRecord;
   message: string;
 }> {
-  const registrationStateToken = getTeacherRegistrationStateToken();
+  const registrationStateToken = explicitStateToken || getTeacherRegistrationStateToken();
   const result = await safeFetchJson<any>('/api/teacher-registration/verify-gmail-otp', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -493,8 +499,9 @@ export async function verifyTeacherGmailOtp(
   }
 
   const data = result.data;
-  if (data.registrationStateToken) {
-    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  const nextStateToken = data.registrationStateToken || data.registration?.registrationStateToken;
+  if (nextStateToken) {
+    saveTeacherRegistrationStateToken(nextStateToken);
   }
 
   return {
@@ -509,13 +516,14 @@ export async function verifyTeacherGmailOtp(
 
 export async function verifyTeacherPhoneOtp(
   registrationId: string,
-  firebaseIdToken: string
+  firebaseIdToken: string,
+  explicitStateToken?: string
 ): Promise<{
   success: boolean;
   registration?: TeacherRegistrationRecord;
   message: string;
 }> {
-  const registrationStateToken = getTeacherRegistrationStateToken();
+  const registrationStateToken = explicitStateToken || getTeacherRegistrationStateToken();
   const result = await safeFetchJson<any>('/api/teacher-registration/verify-phone-otp', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -532,8 +540,9 @@ export async function verifyTeacherPhoneOtp(
   }
 
   const data = result.data;
-  if (data.registrationStateToken) {
-    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  const nextStateToken = data.registrationStateToken || data.registration?.registrationStateToken;
+  if (nextStateToken) {
+    saveTeacherRegistrationStateToken(nextStateToken);
   }
 
   return {
@@ -557,8 +566,10 @@ export async function fetchTeacherRegistrationStatus(identifier: string): Promis
   };
   message?: string;
 }> {
+  const stateToken = getTeacherRegistrationStateToken();
+  const query = stateToken ? `?stateToken=${encodeURIComponent(stateToken)}` : '';
   const result = await safeFetchJson<any>(
-    `/api/teacher-registration/status/${encodeURIComponent(identifier.trim())}`
+    `/api/teacher-registration/status/${encodeURIComponent(identifier.trim())}${query}`
   );
   if (!result.isJson || !result.data) {
     return {
@@ -569,8 +580,9 @@ export async function fetchTeacherRegistrationStatus(identifier: string): Promis
     };
   }
   const data = result.data;
-  if (data.registrationStateToken) {
-    saveTeacherRegistrationStateToken(data.registrationStateToken);
+  const nextStateToken = data.registrationStateToken || data.registration?.registrationStateToken;
+  if (nextStateToken) {
+    saveTeacherRegistrationStateToken(nextStateToken);
   }
   return {
     found: Boolean(result.ok && data.found),

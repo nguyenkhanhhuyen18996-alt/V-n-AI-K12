@@ -510,6 +510,7 @@ export interface TeacherRegistrationRecord {
   remainingClassesQuota?: number;
   totalEnrolledStudentsCount?: number;
   classes?: ClassroomRecord[];
+  registrationStateToken?: string;
   createdAt: string;
   updatedAt: string;
 }
