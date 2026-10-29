@@ -86,10 +86,7 @@ export function isVerifiedTeacherSession(): boolean {
   const token = getActiveSessionToken();
   if (!user || !token || user.status !== 'active') return false;
   if (user.role === 'admin') return true;
-  return Boolean(
-    user.role === 'teacher' &&
-      (!user.teacherApprovalStatus || user.teacherApprovalStatus === 'approved')
-  );
+  return Boolean(user.role === 'teacher' && user.teacherApprovalStatus === 'approved');
 }
 
 function getAuthHeaders(): Record<string, string> {
@@ -99,6 +96,54 @@ function getAuthHeaders(): Record<string, string> {
     headers['Authorization'] = `Bearer ${token}`;
   }
   return headers;
+}
+
+/**
+ * Đồng bộ và xác minh lại phiên đăng nhập hiện tại với máy chủ (/api/auth/me)
+ * để đảm bảo trạng thái duyệt Giáo viên (teacherApprovalStatus) và UID luôn khớp thực tế.
+ */
+export async function verifyActiveSessionWithServer(): Promise<{
+  valid: boolean;
+  user?: UserAccount;
+  error?: string;
+}> {
+  const token = getActiveSessionToken();
+  const savedUser = getSavedSessionUser();
+  if (!token || !savedUser) {
+    return { valid: false };
+  }
+
+  const result = await safeFetchJson<any>('/api/auth/me', {
+    headers: getAuthHeaders()
+  });
+
+  if (result.ok && result.isJson && result.data?.authenticated && result.data?.user) {
+    const serverUser = result.data.user as UserAccount;
+    saveAuthSession(serverUser, token, result.data.adminApprovalSignature);
+    return { valid: true, user: serverUser };
+  }
+
+  if (result.status === 401 || result.status === 403) {
+    saveAuthSession(null, null, null);
+    return {
+      valid: false,
+      error:
+        result.data?.error ||
+        result.errorMessage ||
+        'Phiên đăng nhập không còn hợp lệ hoặc tài khoản chưa được Quản trị viên phê duyệt.'
+    };
+  }
+
+  // Trường hợp lỗi mạng tạm thời: chỉ giữ phiên nếu trạng thái cục bộ hợp lệ rõ ràng
+  if (savedUser.role === 'teacher' && savedUser.teacherApprovalStatus !== 'approved') {
+    saveAuthSession(null, null, null);
+    return {
+      valid: false,
+      error: 'Tài khoản Giáo viên chưa được Quản trị viên phê duyệt.'
+    };
+  }
+
+  return { valid: true, user: savedUser };
 }
 
 /**
@@ -597,11 +642,16 @@ export async function fetchTeacherRegistrationStatus(identifier: string): Promis
 // ============================================================================
 export async function fetchAdminOverview(): Promise<AdminOverviewData | null> {
   if (!isVerifiedAdminSession()) return null;
-  const res = await fetch('/api/admin/overview', {
+  const result = await safeFetchJson<AdminOverviewData>('/api/admin/overview', {
     headers: getAuthHeaders()
   });
-  if (!res.ok) return null;
-  return await res.json();
+  if (!result.ok || !result.isJson || !result.data) {
+    throw new Error(
+      result.errorMessage ||
+        `Không thể tải dữ liệu Quản trị viên (HTTP ${result.status}).`
+    );
+  }
+  return result.data;
 }
 
 export async function reviewTeacherRegistrationByAdmin(payload: {
@@ -617,16 +667,27 @@ export async function reviewTeacherRegistrationByAdmin(payload: {
   if (!isVerifiedAdminSession()) {
     throw new Error('Từ chối truy cập: Chỉ Quản trị viên mới có quyền duyệt giáo viên.');
   }
-  const res = await fetch('/api/admin/teacher-review', {
+  const result = await safeFetchJson<any>('/api/admin/teacher-review', {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify(payload)
   });
-  const data = await res.json();
+  if (!result.isJson || !result.data) {
+    return {
+      success: false,
+      message:
+        result.errorMessage ||
+        `Lỗi kết nối máy chủ khi xét duyệt giáo viên (HTTP ${result.status}).`
+    };
+  }
+  const data = result.data;
   return {
-    success: Boolean(res.ok && data.success),
+    success: Boolean(result.ok && data.success),
     registration: data.registration,
-    message: data.message || (res.ok ? 'Đã cập nhật trạng thái giáo viên.' : 'Lỗi xét duyệt.')
+    message:
+      data.message ||
+      result.errorMessage ||
+      (result.ok ? 'Đã cập nhật trạng thái giáo viên.' : 'Lỗi xét duyệt.')
   };
 }
 
@@ -654,11 +715,11 @@ export async function fetchTeacherClasses(): Promise<{
     };
   }
   try {
-    const res = await fetch('/api/classes', {
+    const result = await safeFetchJson<any>('/api/classes', {
       headers: getAuthHeaders()
     });
-    if (res.ok) {
-      const data = await res.json();
+    if (result.ok && result.isJson && result.data) {
+      const data = result.data;
       cachedClasses = data.classes || [];
       return {
         classes: cachedClasses,
@@ -697,17 +758,25 @@ export async function createTeacherClassroom(name: string): Promise<{
   if (!isVerifiedTeacherSession()) {
     throw new Error('Từ chối truy cập: Chỉ Giáo viên đã được Quản trị viên duyệt mới được tạo lớp học.');
   }
-  const res = await fetch('/api/classes', {
+  const result = await safeFetchJson<any>('/api/classes', {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify({ name })
   });
-  const data = await res.json();
-  if (!res.ok) {
+  if (!result.isJson || !result.data) {
+    return {
+      success: false,
+      message:
+        result.errorMessage ||
+        `Không thể kết nối máy chủ khi tạo lớp (HTTP ${result.status}).`
+    };
+  }
+  const data = result.data;
+  if (!result.ok) {
     return {
       success: false,
       quota: data.quota,
-      message: data.error || 'Không thể tạo lớp mới.'
+      message: data.error || data.message || result.errorMessage || 'Không thể tạo lớp mới.'
     };
   }
   return {

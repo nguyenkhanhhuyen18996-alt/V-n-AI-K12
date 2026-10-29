@@ -854,6 +854,15 @@ function extractBearerToken(req) {
   }
   return void 0;
 }
+function ensureDataDirExists() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+  } catch (err) {
+    console.warn("[Server] Không thể khởi tạo thư mục dữ liệu cục bộ:", err);
+  }
+}
 function loadServerAccounts() {
   try {
     if (fs.existsSync(ACCOUNTS_FILE)) {
@@ -868,11 +877,17 @@ function loadServerAccounts() {
   }
   return [];
 }
-function saveServerAccounts(accounts) {
+function saveServerAccounts(accounts, throwOnError = false) {
   try {
+    ensureDataDirExists();
     fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), "utf-8");
+    return true;
   } catch (err) {
     console.error("Error saving server accounts:", err);
+    if (throwOnError) {
+      throw new Error(`Không thể ghi danh sách tài khoản vào bộ nhớ máy chủ: ${err?.message || err}`);
+    }
+    return false;
   }
 }
 function loadTeacherRegistrations() {
@@ -887,11 +902,17 @@ function loadTeacherRegistrations() {
   }
   return [];
 }
-function saveTeacherRegistrations(list) {
+function saveTeacherRegistrations(list, throwOnError = false) {
   try {
+    ensureDataDirExists();
     fs.writeFileSync(TEACHER_REGISTRATIONS_FILE, JSON.stringify(list, null, 2), "utf-8");
+    return true;
   } catch (err) {
     console.error("Error saving teacher registrations:", err);
+    if (throwOnError) {
+      throw new Error(`Không thể ghi hồ sơ đăng ký giáo viên vào bộ nhớ máy chủ: ${err?.message || err}`);
+    }
+    return false;
   }
 }
 function loadServerClasses() {
@@ -906,11 +927,17 @@ function loadServerClasses() {
   }
   return [];
 }
-function saveServerClasses(list) {
+function saveServerClasses(list, throwOnError = false) {
   try {
+    ensureDataDirExists();
     fs.writeFileSync(CLASSES_FILE, JSON.stringify(list, null, 2), "utf-8");
+    return true;
   } catch (err) {
     console.error("Error saving classes:", err);
+    if (throwOnError) {
+      throw new Error(`Không thể ghi danh sách lớp học vào bộ nhớ máy chủ: ${err?.message || err}`);
+    }
+    return false;
   }
 }
 function loadAdminAuditLogs() {
@@ -927,6 +954,7 @@ function loadAdminAuditLogs() {
 }
 function saveAdminAuditLogs(logs) {
   try {
+    ensureDataDirExists();
     fs.writeFileSync(ADMIN_AUDIT_LOGS_FILE, JSON.stringify(logs, null, 2), "utf-8");
   } catch (err) {
     console.error("Error saving audit logs:", err);
@@ -945,11 +973,779 @@ function loadServerStudentStates() {
 }
 function saveServerStudentStates(states) {
   try {
+    ensureDataDirExists();
     fs.writeFileSync(STUDENT_STATES_FILE, JSON.stringify(states, null, 2), "utf-8");
   } catch (err) {
     console.error("Error saving student states file:", err);
   }
 }
+
+let preferredFirestoreDbId = null;
+let lastFirestoreHydrationMs = 0;
+
+function normalizeFirestoreTimestamp(val, fallbackIso) {
+  if (!val) return fallbackIso || new Date().toISOString();
+  if (typeof val === "string") return val;
+  if (typeof val?.toDate === "function") {
+    try {
+      return val.toDate().toISOString();
+    } catch {
+      return fallbackIso || new Date().toISOString();
+    }
+  }
+  if (typeof val?._seconds === "number") {
+    return new Date(val._seconds * 1000).toISOString();
+  }
+  if (val instanceof Date) {
+    return val.toISOString();
+  }
+  return fallbackIso || new Date().toISOString();
+}
+
+function buildFirestoreSafePayload(rawObj, FieldValueRef, deleteIfUndefinedKeys = []) {
+  const out = {};
+  const deleteSet = new Set(deleteIfUndefinedKeys);
+  for (const [k, v] of Object.entries(rawObj || {})) {
+    if (v === undefined) {
+      if (deleteSet.has(k) && FieldValueRef && typeof FieldValueRef.delete === "function") {
+        out[k] = FieldValueRef.delete();
+      }
+      continue;
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
+async function runServerFirestoreOp(operation) {
+  await ensureFirebaseDepsLoaded();
+  const adminApp = ensureFirebaseAdminInitialized();
+  if (!adminApp || adminApp.__isRestFallback) {
+    return { executed: false, result: null };
+  }
+  const { getFirestore: getAdminFirestore, FieldValue } = await import("firebase-admin/firestore");
+  const appletConfig = getFirebaseProjectConfig();
+  const configuredDbId = String(
+    preferredFirestoreDbId ||
+      process.env.FIRESTORE_DATABASE_ID ||
+      appletConfig.firestoreDatabaseId ||
+      "(default)"
+  ).trim();
+
+  try {
+    const db =
+      configuredDbId && configuredDbId !== "(default)"
+        ? getAdminFirestore(adminApp, configuredDbId)
+        : getAdminFirestore(adminApp);
+    const result = await operation(db, FieldValue);
+    return { executed: true, result };
+  } catch (primaryErr) {
+    if (configuredDbId && configuredDbId !== "(default)") {
+      const defaultDb = getAdminFirestore(adminApp);
+      const result = await operation(defaultDb, FieldValue);
+      preferredFirestoreDbId = "(default)";
+      return { executed: true, result };
+    }
+    throw primaryErr;
+  }
+}
+
+async function resolveOrCreateTeacherFirebaseUid(params) {
+  const { firebaseIdToken, gmail, phone, fullName, password, existingUid } = params || {};
+  const cleanGmail = String(gmail || "").trim().toLowerCase();
+  const cleanPhone = phone ? normalizePhoneE164(String(phone)) : "";
+
+  if (firebaseIdToken && typeof firebaseIdToken === "string" && firebaseIdToken.trim().length > 20) {
+    const tokenCheck = await verifyFirebaseIdTokenOnServer(firebaseIdToken.trim());
+    if (tokenCheck.valid && tokenCheck.uid) {
+      return String(tokenCheck.uid).trim();
+    }
+    if (cleanPhone) {
+      const phoneCheck = await verifyFirebasePhoneIdTokenOnServer(firebaseIdToken.trim(), cleanPhone);
+      if (phoneCheck.verified && phoneCheck.firebaseUid && phoneCheck.firebaseUid !== "fb-phone-verified") {
+        return String(phoneCheck.firebaseUid).trim();
+      }
+    }
+  }
+
+  if (
+    existingUid &&
+    typeof existingUid === "string" &&
+    !existingUid.startsWith("teacher-") &&
+    !existingUid.startsWith("fb-gv-")
+  ) {
+    return existingUid.trim();
+  }
+
+  await ensureFirebaseDepsLoaded();
+  const adminApp = ensureFirebaseAdminInitialized();
+  if (adminApp && !adminApp.__isRestFallback && typeof getAuth === "function") {
+    const adminAuth = getAuth(adminApp);
+    if (cleanGmail) {
+      try {
+        const byEmail = await adminAuth.getUserByEmail(cleanGmail);
+        if (byEmail && byEmail.uid) return byEmail.uid;
+      } catch {
+        // user not found by email yet
+      }
+    }
+    if (cleanPhone) {
+      try {
+        const byPhone = await adminAuth.getUserByPhoneNumber(cleanPhone);
+        if (byPhone && byPhone.uid) return byPhone.uid;
+      } catch {
+        // user not found by phone yet
+      }
+    }
+    if (cleanGmail && password && String(password).length >= 6) {
+      try {
+        const created = await adminAuth.createUser({
+          email: cleanGmail,
+          password: String(password),
+          displayName: String(fullName || "").trim() || undefined
+        });
+        if (created && created.uid) return created.uid;
+      } catch (createErr) {
+        try {
+          const retryByEmail = await adminAuth.getUserByEmail(cleanGmail);
+          if (retryByEmail && retryByEmail.uid) return retryByEmail.uid;
+        } catch {
+          console.warn("[FirebaseAdmin] Không thể tạo trước Firebase Auth user:", createErr?.message || createErr);
+        }
+      }
+    }
+  }
+
+  if (existingUid && typeof existingUid === "string" && existingUid.trim()) {
+    return existingUid.trim();
+  }
+
+  const deterministicHash = crypto
+    .createHash("sha256")
+    .update(`vanai12_teacher_uid:${cleanGmail || cleanPhone}`)
+    .digest("hex")
+    .slice(0, 20);
+  return `fb-gv-${deterministicHash}`;
+}
+
+function normalizeUnifiedTeacherPair(reg, acc, adminRoleDoc) {
+  const nowIso = new Date().toISOString();
+  const phoneVerified = Boolean(reg?.phoneVerified || acc?.phoneVerified);
+  const gmailVerified = Boolean(reg?.gmailVerified || acc?.gmailVerified);
+  const isOwnershipVerified = Boolean(
+    reg?.isOwnershipVerified || phoneVerified || gmailVerified
+  );
+
+  const rawRegStatus = reg?.approvalStatus;
+  const rawAccStatus = acc?.teacherApprovalStatus;
+  const isApprovedInAdminsCollection = Boolean(
+    adminRoleDoc && (adminRoleDoc.role === "teacher" || adminRoleDoc.role === "admin")
+  );
+
+  let unifiedApprovalStatus = "pending_verification";
+  if (rawRegStatus === "rejected" || rawAccStatus === "rejected") {
+    unifiedApprovalStatus = "rejected";
+  } else if (rawRegStatus === "suspended" || rawAccStatus === "suspended") {
+    unifiedApprovalStatus = "suspended";
+  } else if (
+    rawRegStatus === "approved" ||
+    rawAccStatus === "approved" ||
+    isApprovedInAdminsCollection ||
+    (!reg && acc?.role === "teacher" && acc?.status === "active" && !rawAccStatus)
+  ) {
+    unifiedApprovalStatus = "approved";
+  } else if (
+    isOwnershipVerified ||
+    rawRegStatus === "pending_admin_approval" ||
+    rawAccStatus === "pending_admin_approval"
+  ) {
+    unifiedApprovalStatus = "pending_admin_approval";
+  } else {
+    unifiedApprovalStatus = "pending_verification";
+  }
+
+  const unifiedAccountStatus =
+    unifiedApprovalStatus === "approved"
+      ? "active"
+      : unifiedApprovalStatus === "rejected" || unifiedApprovalStatus === "suspended"
+      ? "locked"
+      : "pending_activation";
+
+  if (reg) {
+    reg.phoneVerified = phoneVerified;
+    reg.gmailVerified = gmailVerified;
+    reg.isOwnershipVerified = isOwnershipVerified || unifiedApprovalStatus === "approved";
+    reg.approvalStatus = unifiedApprovalStatus;
+    if (!reg.id) {
+      reg.id = `treg-${reg.teacherUid}`;
+    }
+    reg.createdAt = normalizeFirestoreTimestamp(reg.createdAt, nowIso);
+    reg.updatedAt = normalizeFirestoreTimestamp(reg.updatedAt, reg.createdAt);
+  }
+
+  if (acc && acc.role === "teacher") {
+    acc.phoneVerified = phoneVerified;
+    acc.gmailVerified = gmailVerified;
+    acc.teacherApprovalStatus = unifiedApprovalStatus;
+    acc.status = unifiedAccountStatus;
+    acc.isActivated = true;
+    if (reg) {
+      acc.email = acc.email || reg.gmail;
+      acc.phone = acc.phone || reg.phone;
+      acc.verificationMethod = acc.verificationMethod || reg.verificationMethod;
+      acc.firebasePhoneUid = acc.firebasePhoneUid || reg.firebasePhoneUid;
+      acc.reviewedByUid = reg.reviewedByUid || acc.reviewedByUid;
+      acc.reviewedByName = reg.reviewedByName || acc.reviewedByName;
+      acc.reviewedAt = reg.reviewedAt || acc.reviewedAt;
+      acc.rejectionReason =
+        unifiedApprovalStatus === "approved"
+          ? undefined
+          : reg.rejectionReason || reg.suspensionReason || acc.rejectionReason;
+    }
+    acc.createdAt = normalizeFirestoreTimestamp(acc.createdAt, nowIso);
+  }
+}
+
+function reconcileTeacherRegistrationAndAccountStates(registrations, accounts, adminDocsMap = new Map()) {
+  const regByTeacherUid = new Map();
+  const deduplicatedRegs = [];
+
+  for (const r of registrations) {
+    if (!r || !r.teacherUid) continue;
+    const existing = regByTeacherUid.get(r.teacherUid);
+    if (!existing) {
+      regByTeacherUid.set(r.teacherUid, r);
+      deduplicatedRegs.push(r);
+    } else {
+      const existingTime = new Date(existing.updatedAt || existing.createdAt || 0).getTime();
+      const candidateTime = new Date(r.updatedAt || r.createdAt || 0).getTime();
+      if (candidateTime > existingTime || r.approvalStatus === "approved") {
+        Object.assign(existing, r, {
+          gmailOtpHash: r.gmailOtpHash || existing.gmailOtpHash,
+          gmailOtpSalt: r.gmailOtpSalt || existing.gmailOtpSalt,
+          gmailOtpExpiresAt: r.gmailOtpExpiresAt || existing.gmailOtpExpiresAt
+        });
+      }
+    }
+  }
+
+  registrations.length = 0;
+  registrations.push(...deduplicatedRegs);
+
+  for (const reg of registrations) {
+    let acc = accounts.find(
+      (a) =>
+        a.role === "teacher" &&
+        (a.id === reg.teacherUid ||
+          (reg.firebasePhoneUid && a.id === reg.firebasePhoneUid) ||
+          (reg.gmail && a.email && a.email.toLowerCase() === reg.gmail.toLowerCase()))
+    );
+    if (!acc) {
+      const salt = generateSaltServer();
+      acc = {
+        id: reg.teacherUid,
+        username: reg.username,
+        fullName: reg.fullName,
+        role: "teacher",
+        email: reg.gmail,
+        phone: reg.phone,
+        firebasePhoneUid: reg.firebasePhoneUid,
+        verificationMethod: reg.verificationMethod || "phone_otp",
+        phoneVerified: Boolean(reg.phoneVerified),
+        gmailVerified: Boolean(reg.gmailVerified),
+        teacherApprovalStatus: reg.approvalStatus || "pending_verification",
+        isActivated: true,
+        passwordSalt: salt,
+        passwordHash: hashPasswordServer(crypto.randomBytes(16).toString("hex"), salt),
+        createdAt: reg.createdAt || new Date().toISOString(),
+        status: reg.approvalStatus === "approved" ? "active" : "pending_activation"
+      };
+      accounts.push(acc);
+    } else if (acc.id !== reg.teacherUid) {
+      acc.id = reg.teacherUid;
+    }
+    const adminDoc =
+      adminDocsMap.get(reg.teacherUid) ||
+      (reg.firebasePhoneUid ? adminDocsMap.get(reg.firebasePhoneUid) : undefined);
+    normalizeUnifiedTeacherPair(reg, acc, adminDoc);
+  }
+
+  for (const acc of accounts) {
+    if (acc.role !== "teacher") continue;
+    let reg = registrations.find(
+      (r) =>
+        r.teacherUid === acc.id ||
+        (acc.email && r.gmail && r.gmail.toLowerCase() === acc.email.toLowerCase())
+    );
+    const adminDoc =
+      adminDocsMap.get(acc.id) ||
+      (acc.firebasePhoneUid ? adminDocsMap.get(acc.firebasePhoneUid) : undefined);
+    if (!reg) {
+      normalizeUnifiedTeacherPair(null, acc, adminDoc);
+      reg = {
+        id: `treg-${acc.id}`,
+        teacherUid: acc.id,
+        firebasePhoneUid: acc.firebasePhoneUid,
+        username: acc.username,
+        fullName: acc.fullName,
+        phone: acc.phone || "Chưa cập nhật",
+        gmail: acc.email || "Chưa cập nhật",
+        verificationMethod: acc.verificationMethod || "phone_otp",
+        phoneVerified: Boolean(acc.phoneVerified),
+        gmailVerified: Boolean(acc.gmailVerified),
+        isOwnershipVerified: Boolean(
+          acc.phoneVerified || acc.gmailVerified || acc.teacherApprovalStatus === "approved"
+        ),
+        approvalStatus: acc.teacherApprovalStatus || "pending_verification",
+        rejectionReason: acc.rejectionReason,
+        reviewedByUid: acc.reviewedByUid,
+        reviewedByName: acc.reviewedByName,
+        reviewedAt: acc.reviewedAt,
+        createdAt: acc.createdAt || new Date().toISOString(),
+        updatedAt: acc.createdAt || new Date().toISOString()
+      };
+      normalizeUnifiedTeacherPair(reg, acc, adminDoc);
+      registrations.unshift(reg);
+    } else {
+      normalizeUnifiedTeacherPair(reg, acc, adminDoc);
+    }
+  }
+}
+
+async function hydrateServerStateFromFirestore(force = false) {
+  const localRegs = loadTeacherRegistrations();
+  const localAccounts = loadServerAccounts();
+  const localClasses = loadServerClasses();
+  const adminDocsMap = new Map();
+
+  const nowMs = Date.now();
+  const shouldQueryFirestore =
+    force ||
+    nowMs - lastFirestoreHydrationMs > 1500 ||
+    (localRegs.length === 0 && localAccounts.length === 0);
+
+  if (shouldQueryFirestore) {
+    try {
+      const opRes = await runServerFirestoreOp(async (db) => {
+        const [regsSnap, usersSnap, adminsSnap, classesSnap] = await Promise.all([
+          db.collection("teacher_registrations").get(),
+          db.collection("users").get(),
+          db.collection("admins").get(),
+          db.collection("classes").get()
+        ]);
+        return { regsSnap, usersSnap, adminsSnap, classesSnap };
+      });
+
+      if (opRes.executed && opRes.result) {
+        lastFirestoreHydrationMs = Date.now();
+        const { regsSnap, usersSnap, adminsSnap, classesSnap } = opRes.result;
+
+        for (const docSnap of adminsSnap.docs) {
+          const d = docSnap.data() || {};
+          adminDocsMap.set(d.uid || docSnap.id, d);
+        }
+
+        const regMap = new Map();
+        for (const r of localRegs) {
+          if (r && r.teacherUid) regMap.set(r.teacherUid, r);
+        }
+        for (const docSnap of regsSnap.docs) {
+          const d = docSnap.data() || {};
+          const teacherUid = String(d.teacherUid || "").trim();
+          if (!teacherUid) continue;
+          const remoteReg = {
+            ...d,
+            id: String(d.id || docSnap.id),
+            teacherUid,
+            createdAt: normalizeFirestoreTimestamp(d.createdAt),
+            updatedAt: normalizeFirestoreTimestamp(d.updatedAt)
+          };
+          const localExisting =
+            regMap.get(teacherUid) ||
+            Array.from(regMap.values()).find(
+              (lr) =>
+                lr.id === remoteReg.id ||
+                (lr.gmail && remoteReg.gmail && lr.gmail.toLowerCase() === remoteReg.gmail.toLowerCase())
+            );
+          if (!localExisting) {
+            regMap.set(teacherUid, remoteReg);
+          } else {
+            const localUpdated = new Date(localExisting.updatedAt || localExisting.createdAt || 0).getTime();
+            const remoteUpdated = new Date(remoteReg.updatedAt || remoteReg.createdAt || 0).getTime();
+            const merged =
+              remoteUpdated >= localUpdated
+                ? { ...localExisting, ...remoteReg }
+                : { ...remoteReg, ...localExisting };
+            if (remoteReg.gmailOtpHash && !merged.gmailOtpHash) {
+              merged.gmailOtpHash = remoteReg.gmailOtpHash;
+              merged.gmailOtpSalt = remoteReg.gmailOtpSalt;
+              merged.gmailOtpExpiresAt = remoteReg.gmailOtpExpiresAt;
+            }
+            regMap.set(merged.teacherUid, merged);
+          }
+        }
+        localRegs.length = 0;
+        localRegs.push(...Array.from(regMap.values()));
+
+        const accMap = new Map();
+        for (const a of localAccounts) {
+          if (a && a.id) accMap.set(a.id, a);
+        }
+        for (const docSnap of usersSnap.docs) {
+          const d = docSnap.data() || {};
+          const uid = String(d.id || d.uid || docSnap.id).trim();
+          if (!uid || !d.role) continue;
+          const remoteAcc = {
+            ...d,
+            id: uid,
+            createdAt: normalizeFirestoreTimestamp(d.createdAt)
+          };
+          const localExisting = accMap.get(uid);
+          if (!localExisting) {
+            accMap.set(uid, remoteAcc);
+          } else {
+            accMap.set(uid, {
+              ...remoteAcc,
+              ...localExisting,
+              role: remoteAcc.role || localExisting.role,
+              status: remoteAcc.status || localExisting.status,
+              teacherApprovalStatus:
+                remoteAcc.teacherApprovalStatus || localExisting.teacherApprovalStatus,
+              phoneVerified: Boolean(remoteAcc.phoneVerified || localExisting.phoneVerified),
+              gmailVerified: Boolean(remoteAcc.gmailVerified || localExisting.gmailVerified),
+              passwordHash: localExisting.passwordHash || remoteAcc.passwordHash,
+              passwordSalt: localExisting.passwordSalt || remoteAcc.passwordSalt,
+              activationCode: localExisting.activationCode || remoteAcc.activationCode,
+              activationCodeExpiresAt:
+                localExisting.activationCodeExpiresAt || remoteAcc.activationCodeExpiresAt
+            });
+          }
+        }
+        localAccounts.length = 0;
+        localAccounts.push(...Array.from(accMap.values()));
+
+        const clsMap = new Map();
+        for (const c of localClasses) {
+          if (c && c.id) clsMap.set(c.id, c);
+        }
+        for (const docSnap of classesSnap.docs) {
+          const d = docSnap.data() || {};
+          const cid = String(d.id || docSnap.id).trim();
+          if (!cid || !d.name || !d.teacherUid) continue;
+          clsMap.set(cid, {
+            ...clsMap.get(cid),
+            ...d,
+            id: cid,
+            createdAt: normalizeFirestoreTimestamp(d.createdAt),
+            updatedAt: normalizeFirestoreTimestamp(d.updatedAt)
+          });
+        }
+        localClasses.length = 0;
+        localClasses.push(...Array.from(clsMap.values()));
+      }
+    } catch (err) {
+      console.warn("[FirestoreServer] Không thể đồng bộ từ Firestore, dùng bộ nhớ cục bộ:", err?.message || err);
+    }
+  }
+
+  reconcileTeacherRegistrationAndAccountStates(localRegs, localAccounts, adminDocsMap);
+  saveTeacherRegistrations(localRegs);
+  saveServerAccounts(localAccounts);
+  saveServerClasses(localClasses);
+
+  return {
+    registrations: localRegs,
+    accounts: localAccounts,
+    classes: localClasses
+  };
+}
+
+function migrateTeacherUidAcrossCollections(oldUid, newUid, registrations, accounts, classes) {
+  if (!oldUid || !newUid || oldUid === newUid) return;
+  for (const r of registrations) {
+    if (r.teacherUid === oldUid) {
+      r.teacherUid = newUid;
+    }
+  }
+  for (const a of accounts) {
+    if (a.id === oldUid && a.role === "teacher") {
+      a.id = newUid;
+    }
+    if (a.role === "student" && a.teacherUid === oldUid) {
+      a.teacherUid = newUid;
+    }
+  }
+  for (const c of classes) {
+    if (c.teacherUid === oldUid) {
+      c.teacherUid = newUid;
+    }
+  }
+}
+
+async function persistTeacherRegistrationAndAccount(
+  reg,
+  teacherAcc,
+  registrations,
+  accounts,
+  options = {}
+) {
+  if (options.simulateFailure) {
+    throw new Error("Không thể lưu hồ sơ giáo viên vào cơ sở dữ liệu (Mô phỏng lỗi lưu trữ).");
+  }
+
+  normalizeUnifiedTeacherPair(reg, teacherAcc, null);
+
+  const existingRegIdx = registrations.findIndex(
+    (r) => r.id === reg.id || r.teacherUid === reg.teacherUid
+  );
+  if (existingRegIdx >= 0) {
+    registrations[existingRegIdx] = reg;
+  } else {
+    registrations.unshift(reg);
+  }
+
+  if (teacherAcc) {
+    const existingAccIdx = accounts.findIndex((a) => a.id === teacherAcc.id);
+    if (existingAccIdx >= 0) {
+      accounts[existingAccIdx] = teacherAcc;
+    } else {
+      accounts.push(teacherAcc);
+    }
+  }
+
+  let localSaved = false;
+  let localSaveError = null;
+  try {
+    saveTeacherRegistrations(registrations, true);
+    saveServerAccounts(accounts, true);
+    localSaved = true;
+  } catch (err) {
+    localSaveError = err;
+  }
+
+  let firestoreSaved = false;
+  let firestoreError = null;
+  try {
+    const opRes = await runServerFirestoreOp(async (db, FieldValue) => {
+      const regPayload = buildFirestoreSafePayload(
+        {
+          ...reg,
+          id: reg.id,
+          teacherUid: reg.teacherUid,
+          createdAt: reg.createdAt || new Date().toISOString(),
+          updatedAt: reg.updatedAt || new Date().toISOString()
+        },
+        FieldValue,
+        [
+          "gmailOtpHash",
+          "gmailOtpSalt",
+          "gmailOtpExpiresAt",
+          "rejectionReason",
+          "suspensionReason"
+        ]
+      );
+      await db.collection("teacher_registrations").doc(reg.id).set(regPayload, { merge: true });
+
+      if (teacherAcc) {
+        const userPayload = buildFirestoreSafePayload(
+          {
+            ...teacherAcc,
+            id: teacherAcc.id,
+            uid: teacherAcc.id,
+            className: teacherAcc.className || "Giáo viên",
+            surveyCompleted: true,
+            targetScore: 8.0,
+            createdAt: teacherAcc.createdAt || new Date().toISOString(),
+            updatedAt: reg.updatedAt || new Date().toISOString()
+          },
+          FieldValue,
+          ["rejectionReason", "activationCode", "activationCodeExpiresAt"]
+        );
+        await db.collection("users").doc(teacherAcc.id).set(userPayload, { merge: true });
+      }
+
+      if (options.oldTeacherUid && options.oldTeacherUid !== reg.teacherUid) {
+        await db.collection("users").doc(options.oldTeacherUid).delete().catch(() => {});
+        await db.collection("admins").doc(options.oldTeacherUid).delete().catch(() => {});
+      }
+      if (options.oldRegistrationId && options.oldRegistrationId !== reg.id) {
+        await db
+          .collection("teacher_registrations")
+          .doc(options.oldRegistrationId)
+          .delete()
+          .catch(() => {});
+      }
+
+      if (reg.approvalStatus === "approved") {
+        const adminDocPayload = {
+          uid: reg.teacherUid,
+          role: "teacher",
+          approvedByUid: reg.reviewedByUid || "admin",
+          approvalSignature: generateAdminApprovalSignature(reg.teacherUid),
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp()
+        };
+        await db.collection("admins").doc(reg.teacherUid).set(adminDocPayload, { merge: true });
+        if (reg.firebasePhoneUid && reg.firebasePhoneUid !== reg.teacherUid) {
+          await db
+            .collection("admins")
+            .doc(reg.firebasePhoneUid)
+            .set({ ...adminDocPayload, uid: reg.firebasePhoneUid }, { merge: true });
+        }
+      } else if (reg.approvalStatus === "rejected" || reg.approvalStatus === "suspended") {
+        await db.collection("admins").doc(reg.teacherUid).delete().catch(() => {});
+      }
+    });
+    firestoreSaved = opRes.executed;
+  } catch (err) {
+    firestoreError = err;
+    console.error("[FirestoreServer] Lỗi ghi hồ sơ giáo viên lên Cloud Firestore:", err?.message || err);
+  }
+
+  if (reg.approvalStatus === "approved") {
+    try {
+      const adminApp = ensureFirebaseAdminInitialized();
+      if (adminApp && !adminApp.__isRestFallback && typeof getAuth === "function") {
+        const adminAuth = getAuth(adminApp);
+        const targetUids = [reg.teacherUid, reg.firebasePhoneUid].filter(Boolean);
+        for (const tUid of new Set(targetUids)) {
+          await adminAuth
+            .setCustomUserClaims(String(tUid), { role: "teacher", teacherApproved: true })
+            .catch(() => {});
+        }
+      }
+    } catch {
+      // ignore if user does not exist in Firebase Auth yet
+    }
+  }
+
+  if (IS_VERCEL_RUNTIME && firestoreError) {
+    throw new Error(
+      `Không thể lưu bền vững hồ sơ giáo viên lên Cloud Firestore: ${
+        firestoreError?.message || firestoreError
+      }`
+    );
+  }
+  if (!localSaved && !firestoreSaved) {
+    throw new Error(
+      `Lưu hồ sơ giáo viên thất bại: ${
+        firestoreError?.message || localSaveError?.message || "Lỗi bộ nhớ máy chủ"
+      }`
+    );
+  }
+}
+
+async function persistClassroomToStores(cls, classes) {
+  const existingIdx = classes.findIndex((c) => c.id === cls.id);
+  if (existingIdx >= 0) {
+    classes[existingIdx] = cls;
+  } else {
+    classes.push(cls);
+  }
+
+  let localSaved = false;
+  let localErr = null;
+  try {
+    saveServerClasses(classes, true);
+    localSaved = true;
+  } catch (err) {
+    localErr = err;
+  }
+
+  let firestoreSaved = false;
+  let firestoreErr = null;
+  try {
+    const opRes = await runServerFirestoreOp(async (db, FieldValue) => {
+      const payload = buildFirestoreSafePayload(
+        {
+          ...cls,
+          id: cls.id,
+          createdAt: cls.createdAt || new Date().toISOString(),
+          updatedAt: cls.updatedAt || new Date().toISOString()
+        },
+        FieldValue
+      );
+      await db.collection("classes").doc(cls.id).set(payload, { merge: true });
+    });
+    firestoreSaved = opRes.executed;
+  } catch (err) {
+    firestoreErr = err;
+    console.error("[FirestoreServer] Lỗi lưu lớp học lên Cloud Firestore:", err?.message || err);
+  }
+
+  if (IS_VERCEL_RUNTIME && firestoreErr) {
+    throw new Error(
+      `Không thể lưu bền vững lớp học lên Cloud Firestore: ${firestoreErr?.message || firestoreErr}`
+    );
+  }
+  if (!localSaved && !firestoreSaved) {
+    throw new Error(
+      `Lưu lớp học thất bại: ${firestoreErr?.message || localErr?.message || "Lỗi ghi dữ liệu"}`
+    );
+  }
+}
+
+async function persistStudentAccountToStores(studentAcc, targetClass, accounts, classes) {
+  saveServerAccounts(accounts, true);
+  saveServerClasses(classes, true);
+  try {
+    await runServerFirestoreOp(async (db, FieldValue) => {
+      const studentPayload = buildFirestoreSafePayload(
+        {
+          ...studentAcc,
+          id: studentAcc.id,
+          uid: studentAcc.id,
+          surveyCompleted: false,
+          targetScore: 7.5,
+          createdAt: studentAcc.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        },
+        FieldValue
+      );
+      await db.collection("users").doc(studentAcc.id).set(studentPayload, { merge: true });
+      await db
+        .collection("student_rosters")
+        .doc(studentAcc.id)
+        .set(
+          buildFirestoreSafePayload(
+            {
+              id: studentAcc.id,
+              username: studentAcc.username,
+              fullName: studentAcc.fullName,
+              role: "student",
+              className: studentAcc.className,
+              status: studentAcc.status,
+              isActivated: Boolean(studentAcc.isActivated),
+              createdByUid: studentAcc.teacherUid,
+              notes: studentAcc.notes,
+              createdAt: studentAcc.createdAt || new Date().toISOString(),
+              updatedAt: new Date().toISOString()
+            },
+            FieldValue
+          ),
+          { merge: true }
+        );
+      if (targetClass) {
+        await db
+          .collection("classes")
+          .doc(targetClass.id)
+          .set(
+            buildFirestoreSafePayload(
+              {
+                ...targetClass,
+                updatedAt: targetClass.updatedAt || new Date().toISOString()
+              },
+              FieldValue
+            ),
+            { merge: true }
+          );
+      }
+    });
+  } catch (err) {
+    console.warn("[FirestoreServer] Cảnh báo đồng bộ học sinh lên Firestore:", err?.message || err);
+  }
+}
+
 function isAuthorizedAdminUid(uid) {
   const cleanUid = String(uid || "").trim();
   if (!cleanUid) return false;
@@ -1564,9 +2360,33 @@ async function verifyFirebasePhoneIdTokenOnServer(firebaseIdToken, expectedPhone
     };
   }
 }
+async function resolveOrHydrateVerifiedSessionUserAsync(verified) {
+  await hydrateServerStateFromFirestore(false);
+  return resolveOrHydrateVerifiedSessionUser(verified);
+}
+
 function resolveOrHydrateVerifiedSessionUser(verified) {
   const accounts = loadServerAccounts();
-  let dbUser = accounts.find((a) => a.id === verified.uid);
+  const registrations = loadTeacherRegistrations();
+  let dbUser = accounts.find(
+    (a) =>
+      a.id === verified.uid ||
+      (a.firebasePhoneUid && a.firebasePhoneUid === verified.uid) ||
+      (verified.username &&
+        a.role === verified.role &&
+        a.username &&
+        a.username.toUpperCase() === String(verified.username).toUpperCase())
+  );
+  if (dbUser && dbUser.role === "teacher") {
+    const reg = registrations.find(
+      (r) =>
+        r.teacherUid === dbUser.id ||
+        (r.username &&
+          dbUser.username &&
+          r.username.toUpperCase() === dbUser.username.toUpperCase())
+    );
+    normalizeUnifiedTeacherPair(reg, dbUser);
+  }
   const configuredFirstAdminUid = getConfiguredFirstAdminUid();
   if (!dbUser && verified.role === "admin" && (!configuredFirstAdminUid || verified.uid === configuredFirstAdminUid)) {
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -1589,90 +2409,124 @@ function resolveOrHydrateVerifiedSessionUser(verified) {
   }
   return dbUser;
 }
-function requireAuth(req, res, next) {
-  const token = extractBearerToken(req);
-  const verified = verifySessionToken(token);
-  if (!verified) {
-    res.status(401).json({
-      error: "Phi\xEAn \u0111\u0103ng nh\u1EADp kh\xF4ng h\u1EE3p l\u1EC7 ho\u1EB7c \u0111\xE3 h\u1EBFt h\u1EA1n. Vui l\xF2ng \u0111\u0103ng nh\u1EADp l\u1EA1i."
-    });
-    return;
+
+async function requireAuth(req, res, next) {
+  try {
+    const token = extractBearerToken(req);
+    const verified = verifySessionToken(token);
+    if (!verified) {
+      res.status(401).json({
+        error: "Phi\xEAn \u0111\u0103ng nh\u1EADp kh\xF4ng h\u1EE3p l\u1EC7 ho\u1EB7c \u0111\xE3 h\u1EBFt h\u1EA1n. Vui l\xF2ng \u0111\u0103ng nh\u1EADp l\u1EA1i."
+      });
+      return;
+    }
+    let dbUser = await resolveOrHydrateVerifiedSessionUserAsync(verified);
+    if (!dbUser) {
+      await hydrateServerStateFromFirestore(true);
+      dbUser = resolveOrHydrateVerifiedSessionUser(verified);
+    }
+    if (!dbUser || dbUser.status === "locked") {
+      res.status(403).json({
+        error: "T\xE0i kho\u1EA3n kh\xF4ng t\u1ED3n t\u1EA1i ho\u1EB7c \u0111\xE3 b\u1ECB kh\xF3a."
+      });
+      return;
+    }
+    req.authSession = { ...verified, uid: dbUser.id, role: dbUser.role, username: dbUser.username };
+    req.authUser = dbUser;
+    next();
+  } catch (err) {
+    next(err);
   }
-  const dbUser = resolveOrHydrateVerifiedSessionUser(verified);
-  if (!dbUser || dbUser.status === "locked") {
-    res.status(403).json({
-      error: "T\xE0i kho\u1EA3n kh\xF4ng t\u1ED3n t\u1EA1i ho\u1EB7c \u0111\xE3 b\u1ECB kh\xF3a."
-    });
-    return;
-  }
-  req.authSession = verified;
-  req.authUser = dbUser;
-  next();
 }
-function requireAdminAuth(req, res, next) {
-  const token = extractBearerToken(req);
-  const verified = verifySessionToken(token);
-  if (!verified) {
-    res.status(401).json({
-      error: "Y\xEAu c\u1EA7u \u0111\u0103ng nh\u1EADp: Ch\u1EC9 Qu\u1EA3n tr\u1ECB vi\xEAn m\u1EDBi \u0111\u01B0\u1EE3c ph\xE9p truy c\u1EADp."
-    });
-    return;
+
+async function requireAdminAuth(req, res, next) {
+  try {
+    const token = extractBearerToken(req);
+    const verified = verifySessionToken(token);
+    if (!verified) {
+      res.status(401).json({
+        error: "Y\xEAu c\u1EA7u \u0111\u0103ng nh\u1EADp: Ch\u1EC9 Qu\u1EA3n tr\u1ECB vi\xEAn m\u1EDBi \u0111\u01B0\u1EE3c ph\xE9p truy c\u1EADp."
+      });
+      return;
+    }
+    if (verified.role !== "admin") {
+      res.status(403).json({
+        error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): Ch\u1EE9c n\u0103ng n\xE0y ch\u1EC9 d\xE0nh cho Qu\u1EA3n tr\u1ECB vi\xEAn h\u1EC7 th\u1ED1ng."
+      });
+      return;
+    }
+    const configuredFirstAdminUid = getConfiguredFirstAdminUid();
+    if (configuredFirstAdminUid && verified.uid !== configuredFirstAdminUid) {
+      res.status(403).json({
+        error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): Ch\u1EC9 t\xE0i kho\u1EA3n c\xF3 UID kh\u1EDBp v\u1EDBi FIRST_ADMIN_UID \u0111\u01B0\u1EE3c c\u1EA5p custom claim admin=true m\u1EDBi c\xF3 quy\u1EC1n Qu\u1EA3n tr\u1ECB vi\xEAn."
+      });
+      return;
+    }
+    const dbUser = await resolveOrHydrateVerifiedSessionUserAsync(verified);
+    if (!dbUser || dbUser.role !== "admin" || dbUser.status !== "active") {
+      res.status(403).json({
+        error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): T\xE0i kho\u1EA3n Qu\u1EA3n tr\u1ECB vi\xEAn kh\xF4ng h\u1EE3p l\u1EC7 ho\u1EB7c \u0111\xE3 b\u1ECB kh\xF3a."
+      });
+      return;
+    }
+    req.authSession = { ...verified, uid: dbUser.id, role: dbUser.role, username: dbUser.username };
+    req.authUser = dbUser;
+    next();
+  } catch (err) {
+    next(err);
   }
-  if (verified.role !== "admin") {
-    res.status(403).json({
-      error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): Ch\u1EE9c n\u0103ng n\xE0y ch\u1EC9 d\xE0nh cho Qu\u1EA3n tr\u1ECB vi\xEAn h\u1EC7 th\u1ED1ng."
-    });
-    return;
-  }
-  const configuredFirstAdminUid = getConfiguredFirstAdminUid();
-  if (configuredFirstAdminUid && verified.uid !== configuredFirstAdminUid) {
-    res.status(403).json({
-      error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): Ch\u1EC9 t\xE0i kho\u1EA3n c\xF3 UID kh\u1EDBp v\u1EDBi FIRST_ADMIN_UID \u0111\u01B0\u1EE3c c\u1EA5p custom claim admin=true m\u1EDBi c\xF3 quy\u1EC1n Qu\u1EA3n tr\u1ECB vi\xEAn."
-    });
-    return;
-  }
-  const dbUser = resolveOrHydrateVerifiedSessionUser(verified);
-  if (!dbUser || dbUser.role !== "admin" || dbUser.status !== "active") {
-    res.status(403).json({
-      error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): T\xE0i kho\u1EA3n Qu\u1EA3n tr\u1ECB vi\xEAn kh\xF4ng h\u1EE3p l\u1EC7 ho\u1EB7c \u0111\xE3 b\u1ECB kh\xF3a."
-    });
-    return;
-  }
-  req.authSession = verified;
-  req.authUser = dbUser;
-  next();
 }
-function requireTeacherAuth(req, res, next) {
-  const token = extractBearerToken(req);
-  const verified = verifySessionToken(token);
-  if (!verified) {
-    res.status(401).json({
-      error: "Y\xEAu c\u1EA7u \u0111\u0103ng nh\u1EADp: Ch\u1EC9 t\xE0i kho\u1EA3n Gi\xE1o vi\xEAn \u0111\xE3 \u0111\u01B0\u1EE3c Qu\u1EA3n tr\u1ECB vi\xEAn duy\u1EC7t m\u1EDBi \u0111\u01B0\u1EE3c ph\xE9p truy c\u1EADp."
-    });
-    return;
+
+async function requireTeacherAuth(req, res, next) {
+  try {
+    const token = extractBearerToken(req);
+    const verified = verifySessionToken(token);
+    if (!verified) {
+      res.status(401).json({
+        error: "Y\xEAu c\u1EA7u \u0111\u0103ng nh\u1EADp: Ch\u1EC9 t\xE0i kho\u1EA3n Gi\xE1o vi\xEAn \u0111\xE3 \u0111\u01B0\u1EE3c Qu\u1EA3n tr\u1ECB vi\xEAn duy\u1EC7t m\u1EDBi \u0111\u01B0\u1EE3c ph\xE9p truy c\u1EADp."
+      });
+      return;
+    }
+    if (verified.role !== "teacher" && verified.role !== "admin") {
+      res.status(403).json({
+        error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): T\xE0i kho\u1EA3n H\u1ECDc sinh kh\xF4ng c\xF3 quy\u1EC1n \u0111\u1ECDc/ghi d\u1EEF li\u1EC7u khu v\u1EF1c Gi\xE1o vi\xEAn."
+      });
+      return;
+    }
+    let dbUser = await resolveOrHydrateVerifiedSessionUserAsync(verified);
+    if (!dbUser || (dbUser.role === "teacher" && dbUser.teacherApprovalStatus !== "approved")) {
+      await hydrateServerStateFromFirestore(true);
+      dbUser = resolveOrHydrateVerifiedSessionUser(verified);
+    }
+    if (!dbUser) {
+      res.status(403).json({
+        error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): Kh\xF4ng t\xECm th\u1EA5y h\u1ED3 s\u01A1 t\xE0i kho\u1EA3n Gi\xE1o vi\xEAn tr\xEAn h\u1EC7 th\u1ED1ng. Vui l\xF2ng \u0111\u0103ng xu\u1EA5t v\xE0 \u0111\u0103ng nh\u1EADp l\u1EA1i."
+      });
+      return;
+    }
+    if (dbUser.role === "teacher" && dbUser.teacherApprovalStatus !== "approved") {
+      res.status(403).json({
+        error:
+          dbUser.teacherApprovalStatus === "pending_verification"
+            ? "T\u1EEB ch\u1ED1i truy c\u1EADp (403): T\xE0i kho\u1EA3n Gi\xE1o vi\xEAn ch\u01B0a ho\xE0n t\u1EA5t x\xE1c minh OTP (S\u1ED1 \u0111i\u1EC7n tho\u1EA1i ho\u1EB7c Gmail)."
+            : dbUser.teacherApprovalStatus === "pending_admin_approval"
+            ? 'T\u1EEB ch\u1ED1i truy c\u1EADp (403): H\u1ED3 s\u01A1 Gi\xE1o vi\xEAn c\u1EE7a b\u1EA1n \u0111ang \u1EDF tr\u1EA1ng th\xE1i "Ch\u1EDD Qu\u1EA3n tr\u1ECB vi\xEAn duy\u1EC7t". Vui l\xF2ng ch\u1EDD Qu\u1EA3n tr\u1ECB vi\xEAn ph\xEA duy\u1EC7t tr\u01B0\u1EDBc khi t\u1EA1o l\u1EDBp.'
+            : `T\u1EEB ch\u1ED1i truy c\u1EADp (403): T\xE0i kho\u1EA3n Gi\xE1o vi\xEAn ch\u01B0a \u0111\u01B0\u1EE3c ph\xEA duy\u1EC7t ho\u1EB7c \u0111\xE3 b\u1ECB t\u1EA1m kh\xF3a (${dbUser.rejectionReason || dbUser.teacherApprovalStatus}).`
+      });
+      return;
+    }
+    if (dbUser.status !== "active") {
+      res.status(403).json({
+        error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): T\xE0i kho\u1EA3n kh\xF4ng \u1EDF tr\u1EA1ng th\xE1i ho\u1EA1t \u0111\u1ED9ng ho\u1EB7c \u0111ang b\u1ECB t\u1EA1m kh\xF3a."
+      });
+      return;
+    }
+    req.authSession = { ...verified, uid: dbUser.id, role: dbUser.role, username: dbUser.username };
+    req.authUser = dbUser;
+    next();
+  } catch (err) {
+    next(err);
   }
-  if (verified.role !== "teacher" && verified.role !== "admin") {
-    res.status(403).json({
-      error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): T\xE0i kho\u1EA3n H\u1ECDc sinh kh\xF4ng c\xF3 quy\u1EC1n \u0111\u1ECDc/ghi d\u1EEF li\u1EC7u khu v\u1EF1c Gi\xE1o vi\xEAn."
-    });
-    return;
-  }
-  const dbUser = resolveOrHydrateVerifiedSessionUser(verified);
-  if (!dbUser || dbUser.status !== "active") {
-    res.status(403).json({
-      error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): T\xE0i kho\u1EA3n kh\xF4ng h\u1EE3p l\u1EC7 ho\u1EB7c \u0111ang b\u1ECB t\u1EA1m kh\xF3a."
-    });
-    return;
-  }
-  if (dbUser.role === "teacher" && dbUser.teacherApprovalStatus !== "approved") {
-    res.status(403).json({
-      error: "T\u1EEB ch\u1ED1i truy c\u1EADp (403): T\xE0i kho\u1EA3n Gi\xE1o vi\xEAn ch\u01B0a \u0111\u01B0\u1EE3c Qu\u1EA3n tr\u1ECB vi\xEAn ph\xEA duy\u1EC7t. Ch\u1EC9 gi\xE1o vi\xEAn \u0111\xE3 x\xE1c minh OTP v\xE0 \u0111\u01B0\u1EE3c Qu\u1EA3n tr\u1ECB vi\xEAn duy\u1EC7t m\u1EDBi \u0111\u01B0\u1EE3c s\u1EED d\u1EE5ng khu v\u1EF1c gi\xE1o vi\xEAn."
-    });
-    return;
-  }
-  req.authSession = verified;
-  req.authUser = dbUser;
-  next();
 }
 function sanitizeAccountForClient(acc, includeActivationCode = false) {
   const { passwordHash, passwordSalt, activationCode, activationCodeExpiresAt, ...safe } = acc;
@@ -1780,7 +2634,8 @@ function sanitizeRegistrationForClient(reg, classes, accounts) {
 function createApiApp() {
   const app = express();
   app.use(express.json({ limit: "25mb" }));
-  app.get("/api/health", (_req, res) => {
+  app.get("/api/health", async (_req, res) => {
+    await hydrateServerStateFromFirestore(false);
     const accounts = loadServerAccounts();
     const configuredUid = getConfiguredFirstAdminUid();
     const hasAdminAccount = accounts.some(
@@ -1799,7 +2654,8 @@ function createApiApp() {
       timestamp: (/* @__PURE__ */ new Date()).toISOString()
     });
   });
-  const handleBootstrapStatus = (_req, res) => {
+  const handleBootstrapStatus = async (_req, res) => {
+    await hydrateServerStateFromFirestore(false);
     const accounts = loadServerAccounts();
     const configuredUid = getConfiguredFirstAdminUid();
     const adminStatus = getFirebaseAdminStatus();
@@ -1872,6 +2728,7 @@ function createApiApp() {
       return;
     }
     try {
+      await hydrateServerStateFromFirestore(true);
       const execResult = await executeServerAdminBootstrap(configuredUid);
       const accounts = loadServerAccounts().filter(
         (a) => !(a.role === "admin" && a.id !== configuredUid)
@@ -1922,8 +2779,8 @@ function createApiApp() {
       message: "Gi\xE1o vi\xEAn kh\xF4ng th\u1EC3 t\u1EF1 c\u1EA5p quy\u1EC1n tr\u1EF1c ti\u1EBFp. Vui l\xF2ng g\u1EEDi y\xEAu c\u1EA7u \u0111\u0103ng k\xFD Gi\xE1o vi\xEAn, x\xE1c minh m\xE3 OTP (S\u1ED1 \u0111i\u1EC7n tho\u1EA1i ho\u1EB7c Gmail) v\xE0 ch\u1EDD Qu\u1EA3n tr\u1ECB vi\xEAn ph\xEA duy\u1EC7t."
     });
   });
-  app.post("/api/teacher-registration/submit", (req, res) => {
-    const { username, fullName, phone, gmail, password, verificationMethod } = req.body || {};
+  app.post("/api/teacher-registration/submit", async (req, res) => {
+    const { username, fullName, phone, gmail, password, verificationMethod, firebaseIdToken } = req.body || {};
     if (!fullName || !phone || !gmail || !password) {
       res.status(400).json({
         success: false,
@@ -1955,12 +2812,16 @@ function createApiApp() {
     }
     const normalizedPhone = normalizePhoneE164(String(phone));
     const method = verificationMethod === "gmail_otp" ? "gmail_otp" : "phone_otp";
+    await hydrateServerStateFromFirestore(true);
     const accounts = loadServerAccounts();
     const registrations = loadTeacherRegistrations();
     const classes = loadServerClasses();
     const desiredUsername = username ? String(username).trim().toUpperCase() : `GV-${normalizedPhone.slice(-6)}`;
     const existingReg = registrations.find(
-      (r) => r.gmail.toLowerCase() === normalizedGmail || normalizePhoneE164(r.phone) === normalizedPhone || r.username.toUpperCase() === desiredUsername
+      (r) =>
+        (r.gmail && r.gmail.toLowerCase() === normalizedGmail) ||
+        (r.phone && normalizePhoneE164(r.phone) === normalizedPhone) ||
+        (r.username && r.username.toUpperCase() === desiredUsername)
     );
     if (existingReg) {
       if (existingReg.approvalStatus === "approved") {
@@ -1970,32 +2831,88 @@ function createApiApp() {
         });
         return;
       }
+      const resolvedUid = await resolveOrCreateTeacherFirebaseUid({
+        email: normalizedGmail,
+        phone: normalizedPhone,
+        fullName: String(fullName).trim(),
+        password: String(password),
+        firebaseIdToken: firebaseIdToken ? String(firebaseIdToken) : undefined,
+        existingUid: existingReg.teacherUid
+      });
+      let oldTeacherUid = existingReg.teacherUid;
+      let linkedAcc = accounts.find((a) => a.id === existingReg.teacherUid);
+      if (resolvedUid && resolvedUid !== existingReg.teacherUid) {
+        migrateTeacherUidAcrossCollections(
+          existingReg.teacherUid,
+          resolvedUid,
+          registrations,
+          accounts,
+          classes
+        );
+        linkedAcc = accounts.find((a) => a.id === resolvedUid);
+      } else {
+        oldTeacherUid = undefined;
+      }
       existingReg.fullName = String(fullName).trim();
       existingReg.phone = normalizedPhone;
       existingReg.gmail = normalizedGmail;
       existingReg.verificationMethod = method;
       existingReg.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-      const linkedAcc = accounts.find((a) => a.id === existingReg.teacherUid);
+      const salt2 = generateSaltServer();
       if (linkedAcc) {
-        const salt2 = generateSaltServer();
         linkedAcc.fullName = existingReg.fullName;
         linkedAcc.phone = normalizedPhone;
         linkedAcc.email = normalizedGmail;
         linkedAcc.verificationMethod = method;
         linkedAcc.passwordSalt = salt2;
         linkedAcc.passwordHash = hashPasswordServer(String(password), salt2);
-        saveServerAccounts(accounts);
+      } else {
+        linkedAcc = {
+          id: existingReg.teacherUid,
+          username: existingReg.username || desiredUsername,
+          fullName: existingReg.fullName,
+          role: "teacher",
+          email: normalizedGmail,
+          phone: normalizedPhone,
+          verificationMethod: method,
+          phoneVerified: Boolean(existingReg.phoneVerified),
+          gmailVerified: Boolean(existingReg.gmailVerified),
+          teacherApprovalStatus: existingReg.approvalStatus || "pending_verification",
+          isActivated: true,
+          passwordSalt: salt2,
+          passwordHash: hashPasswordServer(String(password), salt2),
+          createdAt: existingReg.createdAt || existingReg.updatedAt,
+          status: existingReg.approvalStatus === "approved" ? "active" : "pending_activation",
+          notes: "\u0110\u0103ng k\xFD Gi\xE1o vi\xEAn \u2014 Ch\u1EDD x\xE1c minh OTP v\xE0 Qu\u1EA3n tr\u1ECB vi\xEAn duy\u1EC7t"
+        };
+        accounts.push(linkedAcc);
       }
-      saveTeacherRegistrations(registrations);
+      try {
+        await persistTeacherRegistrationAndAccount(
+          existingReg,
+          linkedAcc,
+          registrations,
+          accounts,
+          { oldTeacherUid }
+        );
+      } catch (saveErr) {
+        res.status(500).json({
+          success: false,
+          message: saveErr?.message || "L\u1ED7i khi l\u01B0u h\u1ED3 s\u01A1 \u0111\u0103ng k\xFD gi\xE1o vi\xEAn. Vui l\xF2ng th\u1EED l\u1EA1i."
+        });
+        return;
+      }
+      const sanitizedExisting = sanitizeRegistrationForClient(existingReg, classes, accounts);
       res.json({
         success: true,
-        registration: sanitizeRegistrationForClient(existingReg, classes, accounts),
+        registration: sanitizedExisting,
+        registrationStateToken: sanitizedExisting.registrationStateToken,
         emailProviderStatus: getEmailProviderStatus(),
         message: existingReg.isOwnershipVerified ? "Y\xEAu c\u1EA7u c\u1EE7a b\u1EA1n \u0111\xE3 x\xE1c minh quy\u1EC1n s\u1EDF h\u1EEFu v\xE0 \u0111ang ch\u1EDD Qu\u1EA3n tr\u1ECB vi\xEAn duy\u1EC7t." : "\u0110\xE3 c\u1EADp nh\u1EADt th\xF4ng tin \u0111\u0103ng k\xFD. Vui l\xF2ng ho\xE0n t\u1EA5t b\u01B0\u1EDBc x\xE1c minh m\xE3 OTP."
       });
       return;
     }
-    if (accounts.some((a) => a.username.toUpperCase() === desiredUsername)) {
+    if (accounts.some((a) => a.username && a.username.toUpperCase() === desiredUsername)) {
       res.status(409).json({
         success: false,
         message: `M\xE3 t\xE0i kho\u1EA3n "${desiredUsername}" \u0111\xE3 t\u1ED3n t\u1EA1i trong h\u1EC7 th\u1ED1ng.`
@@ -2003,8 +2920,14 @@ function createApiApp() {
       return;
     }
     const salt = generateSaltServer();
-    const teacherUid = `teacher-${crypto.randomUUID()}`;
-    const registrationId = `treg-${crypto.randomUUID()}`;
+    const teacherUid = await resolveOrCreateTeacherFirebaseUid({
+      email: normalizedGmail,
+      phone: normalizedPhone,
+      fullName: String(fullName).trim(),
+      password: String(password),
+      firebaseIdToken: firebaseIdToken ? String(firebaseIdToken) : undefined
+    });
+    const registrationId = `treg-${teacherUid}`;
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const newTeacherAccount = {
       id: teacherUid,
@@ -2041,11 +2964,25 @@ function createApiApp() {
     };
     accounts.push(newTeacherAccount);
     registrations.unshift(newRegistration);
-    saveServerAccounts(accounts);
-    saveTeacherRegistrations(registrations);
+    try {
+      await persistTeacherRegistrationAndAccount(
+        newRegistration,
+        newTeacherAccount,
+        registrations,
+        accounts
+      );
+    } catch (saveErr) {
+      res.status(500).json({
+        success: false,
+        message: saveErr?.message || "L\u1ED7i khi l\u01B0u h\u1ED3 s\u01A1 \u0111\u0103ng k\xFD gi\xE1o vi\xEAn l\xEAn h\u1EC7 th\u1ED1ng. Vui l\xF2ng th\u1EED l\u1EA1i."
+      });
+      return;
+    }
+    const sanitizedNew = sanitizeRegistrationForClient(newRegistration, classes, accounts);
     res.json({
       success: true,
-      registration: sanitizeRegistrationForClient(newRegistration, classes, accounts),
+      registration: sanitizedNew,
+      registrationStateToken: sanitizedNew.registrationStateToken,
       emailProviderStatus: getEmailProviderStatus(),
       message: "\u0110\xE3 ghi nh\u1EADn h\u1ED3 s\u01A1 \u0111\u0103ng k\xFD Gi\xE1o vi\xEAn. Vui l\xF2ng x\xE1c minh quy\u1EC1n s\u1EDF h\u1EEFu S\u1ED1 \u0111i\u1EC7n tho\u1EA1i ho\u1EB7c Gmail \u0111\u1EC3 chuy\u1EC3n sang danh s\xE1ch ch\u1EDD Qu\u1EA3n tr\u1ECB vi\xEAn duy\u1EC7t."
     });
@@ -2077,6 +3014,7 @@ function createApiApp() {
       return;
     }
 
+    await hydrateServerStateFromFirestore(true);
     const registrations = loadTeacherRegistrations();
     const accounts = loadServerAccounts();
     let reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
@@ -2139,9 +3077,18 @@ function createApiApp() {
     reg.gmailOtpAttempts = 0;
     reg.lastOtpSentAt = new Date().toISOString();
     reg.updatedAt = new Date().toISOString();
-    saveTeacherRegistrations(registrations);
 
     const linkedAccount = accounts.find((a) => a.id === reg.teacherUid);
+    try {
+      await persistTeacherRegistrationAndAccount(reg, linkedAccount, registrations, accounts);
+    } catch (saveErr) {
+      res.status(500).json({
+        success: false,
+        message: saveErr?.message || "Lỗi lưu trạng thái mã xác minh Gmail trên máy chủ."
+      });
+      return;
+    }
+
     const updatedStateToken = encodeTeacherRegistrationStateToken(reg, linkedAccount);
 
     res.json({
@@ -2154,7 +3101,7 @@ function createApiApp() {
     });
   });
 
-  app.post("/api/teacher-registration/verify-gmail-otp", (req, res) => {
+  app.post("/api/teacher-registration/verify-gmail-otp", async (req, res) => {
     const { registrationId, otpCode, registrationStateToken } = req.body || {};
     if (!registrationId || !otpCode) {
       res.status(400).json({
@@ -2164,6 +3111,7 @@ function createApiApp() {
       return;
     }
 
+    await hydrateServerStateFromFirestore(true);
     const registrations = loadTeacherRegistrations();
     const accounts = loadServerAccounts();
     const classes = loadServerClasses();
@@ -2214,8 +3162,12 @@ function createApiApp() {
       crypto.timingSafeEqual(Buffer.from(candidateHash), Buffer.from(reg.gmailOtpHash));
 
     if (!isMatch) {
-      saveTeacherRegistrations(registrations);
       const linkedAccount = accounts.find((a) => a.id === reg.teacherUid);
+      try {
+        await persistTeacherRegistrationAndAccount(reg, linkedAccount, registrations, accounts);
+      } catch {
+        // ignore save error on failed attempt counter
+      }
       res.status(401).json({
         success: false,
         remainingAttempts: Math.max(0, 5 - reg.gmailOtpAttempts),
@@ -2234,25 +3186,36 @@ function createApiApp() {
     reg.gmailOtpSalt = undefined;
     reg.gmailOtpExpiresAt = undefined;
     reg.gmailOtpAttempts = 0;
-    if (reg.approvalStatus === "pending_verification") {
+    if (reg.approvalStatus !== "approved") {
       reg.approvalStatus = "pending_admin_approval";
     }
     reg.updatedAt = now;
 
-    const teacherAcc = accounts.find((a) => a.id === reg.teacherUid);
+    let teacherAcc = accounts.find((a) => a.id === reg.teacherUid);
     if (teacherAcc) {
       teacherAcc.gmailVerified = true;
       teacherAcc.verificationMethod = "gmail_otp";
-      if (teacherAcc.teacherApprovalStatus === "pending_verification") {
+      if (teacherAcc.teacherApprovalStatus !== "approved") {
         teacherAcc.teacherApprovalStatus = "pending_admin_approval";
+        teacherAcc.status = "pending_activation";
       }
-      saveServerAccounts(accounts);
     }
-    saveTeacherRegistrations(registrations);
 
+    try {
+      await persistTeacherRegistrationAndAccount(reg, teacherAcc, registrations, accounts);
+    } catch (saveErr) {
+      res.status(500).json({
+        success: false,
+        message: saveErr?.message || "Lỗi lưu trạng thái xác minh OTP Gmail vào hệ thống. Vui lòng thử lại."
+      });
+      return;
+    }
+
+    const sanitizedReg = sanitizeRegistrationForClient(reg, classes, accounts);
     res.json({
       success: true,
-      registration: sanitizeRegistrationForClient(reg, classes, accounts),
+      registration: sanitizedReg,
+      registrationStateToken: sanitizedReg.registrationStateToken,
       message: 'Xác minh quyền sở hữu Gmail thành công! Yêu cầu đăng ký của bạn đã chuyển sang trạng thái "Chờ quản trị viên duyệt".'
     });
   });
@@ -2267,6 +3230,7 @@ function createApiApp() {
       return;
     }
 
+    await hydrateServerStateFromFirestore(true);
     const registrations = loadTeacherRegistrations();
     const accounts = loadServerAccounts();
     const classes = loadServerClasses();
@@ -2300,12 +3264,31 @@ function createApiApp() {
       return;
     }
 
+    let oldTeacherUid = undefined;
+    if (
+      verification.firebaseUid &&
+      verification.firebaseUid !== "fb-phone-verified" &&
+      verification.firebaseUid !== reg.teacherUid
+    ) {
+      oldTeacherUid = reg.teacherUid;
+      migrateTeacherUidAcrossCollections(
+        reg.teacherUid,
+        verification.firebaseUid,
+        registrations,
+        accounts,
+        classes
+      );
+    }
+
     const now = new Date().toISOString();
     reg.phoneVerified = true;
     reg.phoneVerifiedAt = now;
     reg.isOwnershipVerified = true;
     reg.verificationMethod = "phone_otp";
-    if (reg.approvalStatus === "pending_verification") {
+    if (verification.firebaseUid && verification.firebaseUid !== "fb-phone-verified") {
+      reg.firebasePhoneUid = verification.firebaseUid;
+    }
+    if (reg.approvalStatus !== "approved") {
       reg.approvalStatus = "pending_admin_approval";
     }
     reg.updatedAt = now;
@@ -2314,23 +3297,44 @@ function createApiApp() {
     if (teacherAcc) {
       teacherAcc.phoneVerified = true;
       teacherAcc.verificationMethod = "phone_otp";
-      if (teacherAcc.teacherApprovalStatus === "pending_verification") {
-        teacherAcc.teacherApprovalStatus = "pending_admin_approval";
+      if (verification.firebaseUid && verification.firebaseUid !== "fb-phone-verified") {
+        teacherAcc.firebasePhoneUid = verification.firebaseUid;
       }
-      saveServerAccounts(accounts);
+      if (teacherAcc.teacherApprovalStatus !== "approved") {
+        teacherAcc.teacherApprovalStatus = "pending_admin_approval";
+        teacherAcc.status = "pending_activation";
+      }
     }
-    saveTeacherRegistrations(registrations);
 
+    try {
+      await persistTeacherRegistrationAndAccount(
+        reg,
+        teacherAcc,
+        registrations,
+        accounts,
+        { oldTeacherUid }
+      );
+    } catch (saveErr) {
+      res.status(500).json({
+        success: false,
+        message: saveErr?.message || "Lỗi lưu trạng thái xác minh OTP Số điện thoại vào hệ thống. Vui lòng thử lại."
+      });
+      return;
+    }
+
+    const sanitizedReg = sanitizeRegistrationForClient(reg, classes, accounts);
     res.json({
       success: true,
-      registration: sanitizeRegistrationForClient(reg, classes, accounts),
+      registration: sanitizedReg,
+      registrationStateToken: sanitizedReg.registrationStateToken,
       message: 'Xác minh OTP Số điện thoại qua Firebase Phone Auth thành công! Yêu cầu của bạn đã chuyển sang trạng thái "Chờ quản trị viên duyệt".'
     });
   });
 
-  app.get("/api/teacher-registration/status/:identifier", (req, res) => {
+  app.get("/api/teacher-registration/status/:identifier", async (req, res) => {
     const identifier = String(req.params.identifier || "").trim().toLowerCase();
     const stateToken = String(req.query?.stateToken || "").trim();
+    await hydrateServerStateFromFirestore(true);
     const registrations = loadTeacherRegistrations();
     const classes = loadServerClasses();
     const accounts = loadServerAccounts();
@@ -2339,34 +3343,39 @@ function createApiApp() {
     }
     const reg = registrations.find(
       (r) =>
-        r.id.toLowerCase() === identifier ||
-        r.teacherUid.toLowerCase() === identifier ||
-        r.username.toLowerCase() === identifier ||
-        r.gmail.toLowerCase() === identifier ||
-        normalizePhoneE164(r.phone).toLowerCase() === normalizePhoneE164(identifier).toLowerCase()
+        (r.id && r.id.toLowerCase() === identifier) ||
+        (r.teacherUid && r.teacherUid.toLowerCase() === identifier) ||
+        (r.username && r.username.toLowerCase() === identifier) ||
+        (r.gmail && r.gmail.toLowerCase() === identifier) ||
+        (r.phone && normalizePhoneE164(r.phone).toLowerCase() === normalizePhoneE164(identifier).toLowerCase())
     );
     if (!reg) {
       res.status(404).json({ found: false, message: "Không tìm thấy hồ sơ đăng ký giáo viên." });
       return;
     }
+    const sanitizedReg = sanitizeRegistrationForClient(reg, classes, accounts);
     res.json({
       found: true,
-      registration: sanitizeRegistrationForClient(reg, classes, accounts),
+      registration: sanitizedReg,
+      registrationStateToken: sanitizedReg.registrationStateToken,
       emailProviderStatus: getEmailProviderStatus()
     });
   });
-  app.get("/api/admin/overview", requireAdminAuth, (_req, res) => {
+  app.get("/api/admin/overview", requireAdminAuth, async (_req, res) => {
+    await hydrateServerStateFromFirestore(true);
     const registrations = loadTeacherRegistrations();
     const accounts = loadServerAccounts();
     const classes = loadServerClasses();
     const auditLogs = loadAdminAuditLogs();
     const regMap = /* @__PURE__ */ new Map();
     for (const r of registrations) {
+      const linkedAcc = accounts.find((a) => a.id === r.teacherUid && a.role === "teacher");
+      normalizeUnifiedTeacherPair(r, linkedAcc);
       regMap.set(r.teacherUid, r);
     }
     for (const acc of accounts) {
       if (acc.role === "teacher" && !regMap.has(acc.id)) {
-        regMap.set(acc.id, {
+        const synthesized = {
           id: `treg-${acc.id}`,
           teacherUid: acc.id,
           username: acc.username,
@@ -2384,7 +3393,9 @@ function createApiApp() {
           reviewedAt: acc.reviewedAt,
           createdAt: acc.createdAt,
           updatedAt: acc.createdAt
-        });
+        };
+        normalizeUnifiedTeacherPair(synthesized, acc);
+        regMap.set(acc.id, synthesized);
       }
     }
     const enrichedRegistrations = Array.from(regMap.values()).map(
@@ -2414,7 +3425,7 @@ function createApiApp() {
       emailProviderStatus: getEmailProviderStatus()
     });
   });
-  app.post("/api/admin/teacher-review", requireAdminAuth, (req, res) => {
+  app.post("/api/admin/teacher-review", requireAdminAuth, async (req, res) => {
     const adminUser = req.authUser;
     const { teacherUid, registrationId, action, reason } = req.body || {};
     if (!action || !["approve", "reject", "suspend", "reactivate"].includes(action)) {
@@ -2424,12 +3435,15 @@ function createApiApp() {
       });
       return;
     }
+    await hydrateServerStateFromFirestore(true);
     const registrations = loadTeacherRegistrations();
     const accounts = loadServerAccounts();
     const classes = loadServerClasses();
     const auditLogs = loadAdminAuditLogs();
     const reg = registrations.find(
-      (r) => teacherUid && r.teacherUid === teacherUid || registrationId && r.id === registrationId
+      (r) =>
+        (teacherUid && (r.teacherUid === teacherUid || r.id === teacherUid)) ||
+        (registrationId && (r.id === registrationId || r.teacherUid === registrationId))
     );
     if (!reg) {
       res.status(404).json({
@@ -2438,13 +3452,32 @@ function createApiApp() {
       });
       return;
     }
-    const teacherAcc = accounts.find((a) => a.id === reg.teacherUid && a.role === "teacher");
+    let teacherAcc = accounts.find(
+      (a) =>
+        (a.id === reg.teacherUid ||
+          (a.username && reg.username && a.username.toUpperCase() === reg.username.toUpperCase())) &&
+        a.role === "teacher"
+    );
     if (!teacherAcc) {
-      res.status(404).json({
-        success: false,
-        message: "Kh\xF4ng t\xECm th\u1EA5y t\xE0i kho\u1EA3n gi\xE1o vi\xEAn li\xEAn k\u1EBFt."
-      });
-      return;
+      const salt = generateSaltServer();
+      teacherAcc = {
+        id: reg.teacherUid,
+        username: reg.username || `GV-${reg.teacherUid.slice(-6).toUpperCase()}`,
+        fullName: reg.fullName,
+        role: "teacher",
+        email: reg.gmail,
+        phone: reg.phone,
+        verificationMethod: reg.verificationMethod || "phone_otp",
+        phoneVerified: Boolean(reg.phoneVerified),
+        gmailVerified: Boolean(reg.gmailVerified),
+        teacherApprovalStatus: reg.approvalStatus,
+        isActivated: true,
+        passwordSalt: salt,
+        passwordHash: hashPasswordServer(crypto.randomBytes(16).toString("hex"), salt),
+        createdAt: reg.createdAt || new Date().toISOString(),
+        status: "pending_activation"
+      };
+      accounts.push(teacherAcc);
     }
     const now = (/* @__PURE__ */ new Date()).toISOString();
     if (action === "approve" || action === "reactivate") {
@@ -2515,16 +3548,22 @@ function createApiApp() {
       performedByName: adminUser.fullName,
       performedAt: now
     };
-    auditLogs.unshift(auditEntry);
-    saveTeacherRegistrations(registrations);
-    saveServerAccounts(accounts);
-    saveAdminAuditLogs(auditLogs);
-    syncTeacherRoleInFirestoreAdminSdk({
-      teacherUid: reg.teacherUid,
-      approved: action === "approve" || action === "reactivate",
-      reviewedByUid: adminUser.id
-    }).catch(() => {
-    });
+    try {
+      await persistTeacherRegistrationAndAccount(reg, teacherAcc, registrations, accounts);
+      auditLogs.unshift(auditEntry);
+      saveAdminAuditLogs(auditLogs);
+      await syncTeacherRoleInFirestoreAdminSdk({
+        teacherUid: reg.teacherUid,
+        approved: action === "approve" || action === "reactivate",
+        reviewedByUid: adminUser.id
+      });
+    } catch (saveErr) {
+      res.status(500).json({
+        success: false,
+        message: saveErr?.message || "L\u1ED7i khi l\u01B0u tr\u1EA1ng th\xE1i x\xE9t duy\u1EC7t gi\xE1o vi\xEAn. Vui l\xF2ng th\u1EED l\u1EA1i."
+      });
+      return;
+    }
     res.json({
       success: true,
       registration: sanitizeRegistrationForClient(reg, classes, accounts),
@@ -2532,8 +3571,9 @@ function createApiApp() {
       message: action === "approve" ? `\u0110\xE3 ph\xEA duy\u1EC7t t\xE0i kho\u1EA3n Gi\xE1o vi\xEAn ${reg.fullName}.` : action === "reject" ? `\u0110\xE3 t\u1EEB ch\u1ED1i y\xEAu c\u1EA7u c\u1EE7a Gi\xE1o vi\xEAn ${reg.fullName}.` : action === "suspend" ? `\u0110\xE3 t\u1EA1m kh\xF3a t\xE0i kho\u1EA3n Gi\xE1o vi\xEAn ${reg.fullName}.` : `\u0110\xE3 m\u1EDF kh\xF3a l\u1EA1i t\xE0i kho\u1EA3n Gi\xE1o vi\xEAn ${reg.fullName}.`
     });
   });
-  app.get(["/api/accounts", "/api/teacher/accounts"], requireTeacherAuth, (req, res) => {
+  app.get(["/api/accounts", "/api/teacher/accounts"], requireTeacherAuth, async (req, res) => {
     const session = req.authSession;
+    await hydrateServerStateFromFirestore(false);
     const accounts = loadServerAccounts();
     const scopedAccounts = session.role === "admin" ? accounts : accounts.filter(
       (acc) => acc.id === session.uid || acc.role === "student" && acc.teacherUid === session.uid
@@ -2542,10 +3582,8 @@ function createApiApp() {
       accounts: scopedAccounts.map((acc) => sanitizeAccountForClient(acc, true))
     });
   });
-  app.get("/api/auth/me", requireAuth, (req, res) => {
-    const session = req.authSession;
-    const accounts = loadServerAccounts();
-    const user = accounts.find((a) => a.id === session.uid);
+  app.get("/api/auth/me", requireAuth, async (req, res) => {
+    const user = req.authUser;
     if (!user || user.status === "locked") {
       res.status(401).json({ authenticated: false });
       return;
@@ -2563,7 +3601,7 @@ function createApiApp() {
       adminApprovalSignature: user.role === "teacher" || user.role === "admin" ? generateAdminApprovalSignature(user.id) : void 0
     });
   });
-  app.post("/api/auth/login", (req, res) => {
+  app.post("/api/auth/login", async (req, res) => {
     const { username, password } = req.body || {};
     if (!username || !password) {
       res.status(400).json({
@@ -2572,12 +3610,14 @@ function createApiApp() {
       });
       return;
     }
+    await hydrateServerStateFromFirestore(true);
     const accounts = loadServerAccounts();
+    const registrations = loadTeacherRegistrations();
     const trimmedInput = String(username).trim();
     const normalizedUsername = trimmedInput.toUpperCase();
     const normalizedEmail = trimmedInput.toLowerCase();
     const user = accounts.find(
-      (a) => a.username.toUpperCase() === normalizedUsername || a.email && a.email.toLowerCase() === normalizedEmail
+      (a) => (a.username && a.username.toUpperCase() === normalizedUsername) || (a.email && a.email.toLowerCase() === normalizedEmail)
     );
     if (!user) {
       res.status(404).json({
@@ -2610,8 +3650,12 @@ function createApiApp() {
       return;
     }
     if (user.role === "teacher") {
-      const registrations = loadTeacherRegistrations();
-      const reg = registrations.find((r) => r.teacherUid === user.id);
+      const reg = registrations.find(
+        (r) =>
+          r.teacherUid === user.id ||
+          (r.username && user.username && r.username.toUpperCase() === user.username.toUpperCase())
+      );
+      normalizeUnifiedTeacherPair(reg, user);
       if (user.teacherApprovalStatus === "pending_verification") {
         res.status(403).json({
           success: false,
@@ -2677,7 +3721,7 @@ function createApiApp() {
       adminApprovalSignature: user.role === "teacher" ? generateAdminApprovalSignature(user.id) : void 0
     });
   });
-  app.post("/api/auth/activate", (req, res) => {
+  app.post("/api/auth/activate", async (req, res) => {
     const { username, activationCode, newPassword } = req.body || {};
     if (!username || !activationCode || !newPassword) {
       res.status(400).json({
@@ -2693,7 +3737,9 @@ function createApiApp() {
       });
       return;
     }
+    await hydrateServerStateFromFirestore(true);
     const accounts = loadServerAccounts();
+    const classes = loadServerClasses();
     const normalizedUsername = String(username).trim().toUpperCase();
     const trimmedCode = String(activationCode).trim();
     const user = accounts.find(
@@ -2738,7 +3784,12 @@ function createApiApp() {
     user.activationCodeExpiresAt = void 0;
     user.status = "active";
     user.lastLoginAt = (/* @__PURE__ */ new Date()).toISOString();
-    saveServerAccounts(accounts);
+    const targetClass = classes.find((c) => c.id === user.classId);
+    try {
+      await persistStudentAccountToStores(user, targetClass, accounts, classes);
+    } catch {
+      saveServerAccounts(accounts);
+    }
     const sessionToken = signSessionToken({
       uid: user.id,
       username: user.username,
@@ -2807,9 +3858,11 @@ function createApiApp() {
       verifiedDisplayName = tokenCheck.displayName || verifiedDisplayName;
       isAdminClaim = Boolean(tokenCheck.isAdminClaim);
     }
+    await hydrateServerStateFromFirestore(true);
     const configuredFirstAdminUid = getConfiguredFirstAdminUid();
     const adminStatus = getFirebaseAdminStatus();
     const accounts = loadServerAccounts();
+    const registrations = loadTeacherRegistrations();
     if (configuredFirstAdminUid && verifiedUid === configuredFirstAdminUid && !isAdminClaim) {
       if (adminStatus.serviceAccountConfigured) {
         try {
@@ -2906,6 +3959,14 @@ function createApiApp() {
       });
       return;
     }
+    if (user.role === "teacher") {
+      const reg = registrations.find(
+        (r) =>
+          r.teacherUid === user.id ||
+          (r.gmail && verifiedEmail && r.gmail.toLowerCase() === verifiedEmail)
+      );
+      normalizeUnifiedTeacherPair(reg, user);
+    }
     if (user.role === "teacher" && user.teacherApprovalStatus !== "approved") {
       res.status(403).json({
         matched: false,
@@ -2940,7 +4001,7 @@ function createApiApp() {
       adminApprovalSignature: user.role === "teacher" ? generateAdminApprovalSignature(user.id) : void 0
     });
   });
-  app.post("/api/auth/change-password", requireAuth, (req, res) => {
+  app.post("/api/auth/change-password", requireAuth, async (req, res) => {
     const session = req.authSession;
     const { userId, oldPass, newPass } = req.body || {};
     if (!userId || !oldPass || !newPass || String(newPass).length < 6) {
@@ -2958,6 +4019,7 @@ function createApiApp() {
       return;
     }
     const accounts = loadServerAccounts();
+    const registrations = loadTeacherRegistrations();
     const user = accounts.find((a) => a.id === userId);
     if (!user || !user.passwordSalt || !user.passwordHash) {
       res.status(404).json({ success: false, message: "Kh\xF4ng t\xECm th\u1EA5y t\xE0i kho\u1EA3n." });
@@ -2971,11 +4033,19 @@ function createApiApp() {
     const newSalt = generateSaltServer();
     user.passwordSalt = newSalt;
     user.passwordHash = hashPasswordServer(String(newPass), newSalt);
-    saveServerAccounts(accounts);
+    if (user.role === "teacher") {
+      const reg = registrations.find((r) => r.teacherUid === user.id);
+      await persistTeacherRegistrationAndAccount(reg, user, registrations, accounts).catch(() => {
+        saveServerAccounts(accounts);
+      });
+    } else {
+      saveServerAccounts(accounts);
+    }
     res.json({ success: true, message: "\u0110\u1ED5i m\u1EADt kh\u1EA9u th\xE0nh c\xF4ng!" });
   });
-  app.get("/api/classes", requireTeacherAuth, (req, res) => {
+  app.get("/api/classes", requireTeacherAuth, async (req, res) => {
     const session = req.authSession;
+    await hydrateServerStateFromFirestore(false);
     const classes = loadServerClasses();
     const accounts = loadServerAccounts();
     const scopedClasses = session.role === "admin" ? classes : classes.filter((c) => c.teacherUid === session.uid);
@@ -2991,8 +4061,9 @@ function createApiApp() {
       }
     });
   });
-  app.get("/api/my-class", requireAuth, (req, res) => {
+  app.get("/api/my-class", requireAuth, async (req, res) => {
     const authUser = req.authUser;
+    await hydrateServerStateFromFirestore(false);
     const classes = loadServerClasses();
     const accounts = loadServerAccounts();
     if (authUser.role === "student") {
@@ -3010,7 +4081,7 @@ function createApiApp() {
   app.post("/api/classes", requireTeacherAuth, async (req, res) => {
     const session = req.authSession;
     const authUser = req.authUser;
-    if (session.role !== "teacher") {
+    if (session.role !== "teacher" && session.role !== "admin") {
       res.status(403).json({
         error: "Ch\u1EC9 t\xE0i kho\u1EA3n Gi\xE1o vi\xEAn \u0111\xE3 \u0111\u01B0\u1EE3c Qu\u1EA3n tr\u1ECB vi\xEAn ph\xEA duy\u1EC7t m\u1EDBi c\xF3 th\u1EC3 t\u1EA1o l\u1EDBp h\u1ECDc ph\u1EE5 tr\xE1ch."
       });
@@ -3023,6 +4094,7 @@ function createApiApp() {
     }
     const normalizedName = rawName.toUpperCase();
     await withQuotaLock(async () => {
+      await hydrateServerStateFromFirestore(true);
       const classes = loadServerClasses();
       const accounts = loadServerAccounts();
       const teacherActiveClasses = classes.filter(
@@ -3059,7 +4131,14 @@ function createApiApp() {
         updatedAt: now
       };
       classes.push(newClass);
-      saveServerClasses(classes);
+      try {
+        await persistClassroomToStores(newClass, classes);
+      } catch (saveErr) {
+        res.status(500).json({
+          error: saveErr?.message || "L\u1ED7i khi l\u01B0u l\u1EDBp h\u1ECDc m\u1EDBi l\xEAn h\u1EC7 th\u1ED1ng. Vui l\xF2ng th\u1EED l\u1EA1i."
+        });
+        return;
+      }
       const newActiveCount = teacherActiveClasses.length + 1;
       res.json({
         success: true,
@@ -3085,6 +4164,7 @@ function createApiApp() {
       return;
     }
     await withQuotaLock(async () => {
+      await hydrateServerStateFromFirestore(true);
       const accounts = loadServerAccounts();
       const classes = loadServerClasses();
       const normalizedUsername = String(username).trim().toUpperCase();
@@ -3178,8 +4258,14 @@ function createApiApp() {
       accounts.unshift(newAccount);
       targetClass.enrolledCount = enrolledInClass.length + 1;
       targetClass.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-      saveServerAccounts(accounts);
-      saveServerClasses(classes);
+      try {
+        await persistStudentAccountToStores(newAccount, targetClass, accounts, classes);
+      } catch (saveErr) {
+        res.status(500).json({
+          error: saveErr?.message || "L\u1ED7i khi l\u01B0u h\u1ECDc sinh m\u1EDBi v\xE0o l\u1EDBp h\u1ECDc."
+        });
+        return;
+      }
       res.json({
         account: sanitizeAccountForClient(newAccount, true),
         classroom: enrichClassroomForClient(targetClass, accounts)
@@ -4252,6 +5338,7 @@ async function handleDirectAuthEndpoint(req, res, pathname) {
     pathname === "/api/admin/config-status"
   ) {
     await ensureFirebaseDepsLoaded();
+    await hydrateServerStateFromFirestore(false);
     const accounts = loadServerAccounts();
     const configuredUid = getConfiguredFirstAdminUid();
     const adminStatus = getFirebaseAdminStatus();
@@ -4354,9 +5441,11 @@ async function handleDirectAuthEndpoint(req, res, pathname) {
       isAdminClaim = Boolean(tokenCheck.isAdminClaim);
     }
 
+    await hydrateServerStateFromFirestore(true);
     const configuredFirstAdminUid = getConfiguredFirstAdminUid();
     const adminStatus = getFirebaseAdminStatus();
     const accounts = loadServerAccounts();
+    const registrations = loadTeacherRegistrations();
 
     if (configuredFirstAdminUid && verifiedUid === configuredFirstAdminUid && !isAdminClaim) {
       if (adminStatus.serviceAccountConfigured) {
@@ -4468,6 +5557,15 @@ async function handleDirectAuthEndpoint(req, res, pathname) {
         message: `Từ chối quyền truy cập (403): Tài khoản Firebase (${verifiedEmail || verifiedUid}, UID: ${verifiedUid}) không khớp với FIRST_ADMIN_UID đã cấu hình trên máy chủ và chưa có hồ sơ Giáo viên/Học sinh được duyệt.`
       });
       return true;
+    }
+
+    if (user.role === "teacher") {
+      const reg = registrations.find(
+        (r) =>
+          r.teacherUid === user.id ||
+          (r.gmail && verifiedEmail && r.gmail.toLowerCase() === verifiedEmail)
+      );
+      normalizeUnifiedTeacherPair(reg, user);
     }
 
     if (user.role === "teacher" && user.teacherApprovalStatus !== "approved") {
@@ -4590,6 +5688,7 @@ async function handleDirectAuthEndpoint(req, res, pathname) {
     }
 
     try {
+      await hydrateServerStateFromFirestore(true);
       const execResult = await executeServerAdminBootstrap(configuredUid);
       const accounts = loadServerAccounts().filter(
         (a) => !(a.role === "admin" && a.id !== configuredUid)
@@ -4653,474 +5752,7 @@ async function handleDirectAuthEndpoint(req, res, pathname) {
     return true;
   }
 
-  // 5. POST /api/teacher-registration/submit
-  if (pathname === "/api/teacher-registration/submit" && method === "POST") {
-    const body = await parseJsonRequestBody(req);
-    const { username, fullName, phone, gmail, password, verificationMethod } = body || {};
-    if (!fullName || !phone || !gmail || !password) {
-      sendJsonResponse(res, 400, {
-        success: false,
-        message: "Vui lòng nhập đầy đủ Họ tên, Số điện thoại, địa chỉ Gmail và Mật khẩu tài khoản."
-      });
-      return true;
-    }
-    if (String(password).length < 6) {
-      sendJsonResponse(res, 400, {
-        success: false,
-        message: "Mật khẩu tài khoản phải có tối thiểu 6 ký tự."
-      });
-      return true;
-    }
-    if (!isValidPhoneFormat(String(phone))) {
-      sendJsonResponse(res, 400, {
-        success: false,
-        message: "Số điện thoại không hợp lệ (VD: 0912345678 hoặc +84912345678)."
-      });
-      return true;
-    }
-    const normalizedGmail = String(gmail).trim().toLowerCase();
-    if (!isValidGmailFormat(normalizedGmail)) {
-      sendJsonResponse(res, 400, {
-        success: false,
-        message: "Địa chỉ Gmail không hợp lệ."
-      });
-      return true;
-    }
-
-    const normalizedPhone = normalizePhoneE164(String(phone));
-    const methodChoice = verificationMethod === "gmail_otp" ? "gmail_otp" : "phone_otp";
-    const accounts = loadServerAccounts();
-    const registrations = loadTeacherRegistrations();
-    const classes = loadServerClasses();
-    const desiredUsername = username
-      ? String(username).trim().toUpperCase()
-      : `GV-${normalizedPhone.slice(-6)}`;
-
-    const existingReg = registrations.find(
-      (r) =>
-        r.gmail.toLowerCase() === normalizedGmail ||
-        normalizePhoneE164(r.phone) === normalizedPhone ||
-        r.username.toUpperCase() === desiredUsername
-    );
-    if (existingReg) {
-      if (existingReg.approvalStatus === "approved") {
-        sendJsonResponse(res, 409, {
-          success: false,
-          message: "Giáo viên với số điện thoại, Gmail hoặc mã tài khoản này đã được duyệt. Vui lòng đăng nhập."
-        });
-        return true;
-      }
-      existingReg.fullName = String(fullName).trim();
-      existingReg.phone = normalizedPhone;
-      existingReg.gmail = normalizedGmail;
-      existingReg.verificationMethod = methodChoice;
-      existingReg.updatedAt = new Date().toISOString();
-      const linkedAcc = accounts.find((a) => a.id === existingReg.teacherUid);
-      if (linkedAcc) {
-        const salt2 = generateSaltServer();
-        linkedAcc.fullName = existingReg.fullName;
-        linkedAcc.phone = normalizedPhone;
-        linkedAcc.email = normalizedGmail;
-        linkedAcc.verificationMethod = methodChoice;
-        linkedAcc.passwordSalt = salt2;
-        linkedAcc.passwordHash = hashPasswordServer(String(password), salt2);
-        saveServerAccounts(accounts);
-      }
-      saveTeacherRegistrations(registrations);
-      const sanitizedExisting = sanitizeRegistrationForClient(existingReg, classes, accounts);
-      sendJsonResponse(res, 200, {
-        success: true,
-        registration: sanitizedExisting,
-        registrationStateToken: sanitizedExisting.registrationStateToken,
-        emailProviderStatus: getEmailProviderStatus(),
-        message: existingReg.isOwnershipVerified
-          ? "Yêu cầu của bạn đã xác minh quyền sở hữu và đang chờ Quản trị viên duyệt."
-          : "Đã cập nhật thông tin đăng ký. Vui lòng hoàn tất bước xác minh mã OTP."
-      });
-      return true;
-    }
-
-    if (accounts.some((a) => a.username.toUpperCase() === desiredUsername)) {
-      sendJsonResponse(res, 409, {
-        success: false,
-        message: `Mã tài khoản "${desiredUsername}" đã tồn tại trong hệ thống.`
-      });
-      return true;
-    }
-
-    const salt = generateSaltServer();
-    const teacherUid = `teacher-${crypto.randomUUID()}`;
-    const registrationId = `treg-${crypto.randomUUID()}`;
-    const now = new Date().toISOString();
-
-    const newTeacherAccount = {
-      id: teacherUid,
-      username: desiredUsername,
-      fullName: String(fullName).trim(),
-      role: "teacher",
-      email: normalizedGmail,
-      phone: normalizedPhone,
-      verificationMethod: methodChoice,
-      phoneVerified: false,
-      gmailVerified: false,
-      teacherApprovalStatus: "pending_verification",
-      isActivated: true,
-      passwordSalt: salt,
-      passwordHash: hashPasswordServer(String(password), salt),
-      createdAt: now,
-      status: "pending_activation",
-      notes: "Đăng ký Giáo viên — Chờ xác minh OTP và Quản trị viên duyệt"
-    };
-
-    const newRegistration = {
-      id: registrationId,
-      teacherUid,
-      username: desiredUsername,
-      fullName: String(fullName).trim(),
-      phone: normalizedPhone,
-      gmail: normalizedGmail,
-      verificationMethod: methodChoice,
-      phoneVerified: false,
-      gmailVerified: false,
-      isOwnershipVerified: false,
-      approvalStatus: "pending_verification",
-      createdAt: now,
-      updatedAt: now
-    };
-
-    accounts.push(newTeacherAccount);
-    registrations.unshift(newRegistration);
-    saveServerAccounts(accounts);
-    saveTeacherRegistrations(registrations);
-
-    const sanitizedNew = sanitizeRegistrationForClient(newRegistration, classes, accounts);
-    sendJsonResponse(res, 200, {
-      success: true,
-      registration: sanitizedNew,
-      registrationStateToken: sanitizedNew.registrationStateToken,
-      emailProviderStatus: getEmailProviderStatus(),
-      message:
-        "Đã ghi nhận hồ sơ đăng ký Giáo viên. Vui lòng xác minh quyền sở hữu Số điện thoại hoặc Gmail để chuyển sang danh sách chờ Quản trị viên duyệt."
-    });
-    return true;
-  }
-
-  // 6. POST /api/teacher-registration/send-gmail-otp
-  if (pathname === "/api/teacher-registration/send-gmail-otp" && method === "POST") {
-    const body = await parseJsonRequestBody(req);
-    const { registrationId, registrationStateToken } = body || {};
-    if (!registrationId) {
-      sendJsonResponse(res, 400, {
-        success: false,
-        message: "Thiếu mã hồ sơ đăng ký (registrationId)."
-      });
-      return true;
-    }
-
-    const registrations = loadTeacherRegistrations();
-    const accounts = loadServerAccounts();
-    let reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
-    if (!reg && registrationStateToken) {
-      reg = hydrateTeacherRegistrationFromStateToken(
-        String(registrationStateToken),
-        registrations,
-        accounts
-      );
-    }
-    if (!reg) {
-      sendJsonResponse(res, 404, {
-        success: false,
-        message: "Không tìm thấy hồ sơ đăng ký giáo viên. Vui lòng gửi lại biểu mẫu đăng ký."
-      });
-      return true;
-    }
-
-    if (reg.lastOtpSentAt) {
-      const elapsedMs = Date.now() - new Date(reg.lastOtpSentAt).getTime();
-      if (elapsedMs < 20000 && !process.env.SMTP_TEST_OUTBOX_FILE) {
-        const waitSec = Math.ceil((20000 - elapsedMs) / 1000);
-        sendJsonResponse(res, 429, {
-          success: false,
-          message: `Vui lòng đợi ${waitSec} giây trước khi yêu cầu gửi lại mã xác minh Gmail.`
-        });
-        return true;
-      }
-    }
-
-    const providerStatus = getEmailProviderStatus();
-    if (!providerStatus.configured) {
-      sendJsonResponse(res, 503, {
-        success: false,
-        providerConfigured: false,
-        providerName: providerStatus.providerName,
-        missingEnvVars: providerStatus.missingEnvVars,
-        message: `Chưa thể gửi mã xác minh đến Gmail (${reg.gmail}) vì máy chủ thiếu cấu hình dịch vụ gửi email (${providerStatus.missingEnvVars.join(", ")}). Hệ thống không tạo mã giả lập và không tự động xác minh. Vui lòng cấu hình biến môi trường gửi mail trên máy chủ hoặc chọn xác minh qua OTP Số điện thoại (Firebase Phone Auth).`
-      });
-      return true;
-    }
-
-    const otpCode = crypto.randomInt(100000, 999999).toString();
-    const otpSalt = generateSaltServer();
-    const otpHash = hashOtpCodeServer(otpCode, otpSalt);
-
-    const delivery = await sendGmailVerificationCodeViaServer(reg.gmail, reg.fullName, otpCode);
-    if (!delivery.sent) {
-      sendJsonResponse(res, 503, {
-        success: false,
-        providerConfigured: false,
-        providerName: providerStatus.providerName,
-        missingEnvVars: providerStatus.missingEnvVars,
-        message: delivery.error || "Không thể gửi email xác minh qua dịch vụ máy chủ."
-      });
-      return true;
-    }
-
-    reg.verificationMethod = "gmail_otp";
-    reg.gmailOtpSalt = otpSalt;
-    reg.gmailOtpHash = otpHash;
-    reg.gmailOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-    reg.gmailOtpAttempts = 0;
-    reg.lastOtpSentAt = new Date().toISOString();
-    reg.updatedAt = new Date().toISOString();
-    saveTeacherRegistrations(registrations);
-
-    const linkedAccount = accounts.find((a) => a.id === reg.teacherUid);
-    const updatedStateToken = encodeTeacherRegistrationStateToken(reg, linkedAccount);
-
-    sendJsonResponse(res, 200, {
-      success: true,
-      providerConfigured: true,
-      providerName: providerStatus.providerName,
-      expiresAt: reg.gmailOtpExpiresAt,
-      registrationStateToken: updatedStateToken,
-      message: `Đã gửi mã xác minh 6 chữ số tới địa chỉ Gmail ${reg.gmail}. Mã có hiệu lực trong 10 phút.`
-    });
-    return true;
-  }
-
-  // 7. POST /api/teacher-registration/verify-gmail-otp
-  if (pathname === "/api/teacher-registration/verify-gmail-otp" && method === "POST") {
-    const body = await parseJsonRequestBody(req);
-    const { registrationId, otpCode, registrationStateToken } = body || {};
-    if (!registrationId || !otpCode) {
-      sendJsonResponse(res, 400, {
-        success: false,
-        message: "Vui lòng nhập đầy đủ mã hồ sơ đăng ký và mã xác minh Gmail 6 chữ số."
-      });
-      return true;
-    }
-
-    const registrations = loadTeacherRegistrations();
-    const accounts = loadServerAccounts();
-    const classes = loadServerClasses();
-    if (registrationStateToken) {
-      hydrateTeacherRegistrationFromStateToken(
-        String(registrationStateToken),
-        registrations,
-        accounts
-      );
-    }
-    const reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
-    if (!reg) {
-      sendJsonResponse(res, 404, {
-        success: false,
-        message: "Không tìm thấy hồ sơ đăng ký giáo viên. Vui lòng gửi lại biểu mẫu đăng ký."
-      });
-      return true;
-    }
-
-    if (!reg.gmailOtpHash || !reg.gmailOtpSalt || !reg.gmailOtpExpiresAt) {
-      sendJsonResponse(res, 400, {
-        success: false,
-        message: 'Chưa có mã xác minh Gmail nào được phát hành hoặc mã đã bị hủy. Vui lòng bấm "Gửi mã xác minh Gmail".'
-      });
-      return true;
-    }
-
-    if ((reg.gmailOtpAttempts || 0) >= 5) {
-      sendJsonResponse(res, 429, {
-        success: false,
-        message: "Bạn đã nhập sai mã xác minh quá 5 lần. Vui lòng yêu cầu gửi lại mã mới."
-      });
-      return true;
-    }
-
-    if (Date.now() > new Date(reg.gmailOtpExpiresAt).getTime()) {
-      sendJsonResponse(res, 401, {
-        success: false,
-        message: "Mã xác minh Gmail đã hết hạn. Vui lòng yêu cầu gửi lại mã mới."
-      });
-      return true;
-    }
-
-    reg.gmailOtpAttempts = (reg.gmailOtpAttempts || 0) + 1;
-    const candidateHash = hashOtpCodeServer(String(otpCode).trim(), reg.gmailOtpSalt);
-    const isMatch =
-      candidateHash.length === reg.gmailOtpHash.length &&
-      crypto.timingSafeEqual(Buffer.from(candidateHash), Buffer.from(reg.gmailOtpHash));
-
-    if (!isMatch) {
-      saveTeacherRegistrations(registrations);
-      const linkedAccount = accounts.find((a) => a.id === reg.teacherUid);
-      sendJsonResponse(res, 401, {
-        success: false,
-        remainingAttempts: Math.max(0, 5 - reg.gmailOtpAttempts),
-        registrationStateToken: encodeTeacherRegistrationStateToken(reg, linkedAccount),
-        message: `Mã xác minh Gmail không chính xác. Còn ${Math.max(0, 5 - reg.gmailOtpAttempts)} lần thử.`
-      });
-      return true;
-    }
-
-    const now = new Date().toISOString();
-    reg.gmailVerified = true;
-    reg.gmailVerifiedAt = now;
-    reg.isOwnershipVerified = true;
-    reg.verificationMethod = "gmail_otp";
-    reg.gmailOtpHash = undefined;
-    reg.gmailOtpSalt = undefined;
-    reg.gmailOtpExpiresAt = undefined;
-    reg.gmailOtpAttempts = 0;
-    if (reg.approvalStatus === "pending_verification") {
-      reg.approvalStatus = "pending_admin_approval";
-    }
-    reg.updatedAt = now;
-
-    const teacherAcc = accounts.find((a) => a.id === reg.teacherUid);
-    if (teacherAcc) {
-      teacherAcc.gmailVerified = true;
-      teacherAcc.verificationMethod = "gmail_otp";
-      if (teacherAcc.teacherApprovalStatus === "pending_verification") {
-        teacherAcc.teacherApprovalStatus = "pending_admin_approval";
-      }
-      saveServerAccounts(accounts);
-    }
-    saveTeacherRegistrations(registrations);
-
-    const sanitizedReg = sanitizeRegistrationForClient(reg, classes, accounts);
-    sendJsonResponse(res, 200, {
-      success: true,
-      registration: sanitizedReg,
-      registrationStateToken: sanitizedReg.registrationStateToken,
-      message: 'Xác minh quyền sở hữu Gmail thành công! Yêu cầu đăng ký của bạn đã chuyển sang trạng thái "Chờ quản trị viên duyệt".'
-    });
-    return true;
-  }
-
-  // 8. POST /api/teacher-registration/verify-phone-otp
-  if (pathname === "/api/teacher-registration/verify-phone-otp" && method === "POST") {
-    const body = await parseJsonRequestBody(req);
-    const { registrationId, firebaseIdToken, registrationStateToken } = body || {};
-    if (!registrationId || !firebaseIdToken) {
-      sendJsonResponse(res, 400, {
-        success: false,
-        message: "Thiếu mã hồ sơ đăng ký hoặc token xác thực Firebase Phone Authentication."
-      });
-      return true;
-    }
-
-    const registrations = loadTeacherRegistrations();
-    const accounts = loadServerAccounts();
-    const classes = loadServerClasses();
-    if (registrationStateToken) {
-      hydrateTeacherRegistrationFromStateToken(
-        String(registrationStateToken),
-        registrations,
-        accounts
-      );
-    }
-    const reg = registrations.find((r) => r.id === registrationId || r.teacherUid === registrationId);
-    if (!reg) {
-      sendJsonResponse(res, 404, {
-        success: false,
-        message: "Không tìm thấy hồ sơ đăng ký giáo viên. Vui lòng gửi lại biểu mẫu đăng ký."
-      });
-      return true;
-    }
-
-    const verification = await verifyFirebasePhoneIdTokenOnServer(
-      String(firebaseIdToken),
-      reg.phone
-    );
-    if (!verification.verified) {
-      sendJsonResponse(res, 401, {
-        success: false,
-        message:
-          verification.error ||
-          "Xác minh OTP Số điện thoại không thành công. Hệ thống không chấp nhận xác minh giả lập."
-      });
-      return true;
-    }
-
-    const now = new Date().toISOString();
-    reg.phoneVerified = true;
-    reg.phoneVerifiedAt = now;
-    reg.isOwnershipVerified = true;
-    reg.verificationMethod = "phone_otp";
-    if (reg.approvalStatus === "pending_verification") {
-      reg.approvalStatus = "pending_admin_approval";
-    }
-    reg.updatedAt = now;
-
-    const teacherAcc = accounts.find((a) => a.id === reg.teacherUid);
-    if (teacherAcc) {
-      teacherAcc.phoneVerified = true;
-      teacherAcc.verificationMethod = "phone_otp";
-      if (teacherAcc.teacherApprovalStatus === "pending_verification") {
-        teacherAcc.teacherApprovalStatus = "pending_admin_approval";
-      }
-      saveServerAccounts(accounts);
-    }
-    saveTeacherRegistrations(registrations);
-
-    const sanitizedReg = sanitizeRegistrationForClient(reg, classes, accounts);
-    sendJsonResponse(res, 200, {
-      success: true,
-      registration: sanitizedReg,
-      registrationStateToken: sanitizedReg.registrationStateToken,
-      message: 'Xác minh OTP Số điện thoại qua Firebase Phone Auth thành công! Yêu cầu của bạn đã chuyển sang trạng thái "Chờ quản trị viên duyệt".'
-    });
-    return true;
-  }
-
-  // 9. GET /api/teacher-registration/status/:identifier
-  if (pathname.startsWith("/api/teacher-registration/status/") && method === "GET") {
-    const rawIdentifier = pathname.slice("/api/teacher-registration/status/".length);
-    const identifier = decodeURIComponent(rawIdentifier || "").trim().toLowerCase();
-    const urlParts = String(req.url || "").split("?");
-    const searchParams = new URLSearchParams(urlParts[1] || "");
-    const stateToken = String(req.query?.stateToken || searchParams.get("stateToken") || "").trim();
-
-    const registrations = loadTeacherRegistrations();
-    const classes = loadServerClasses();
-    const accounts = loadServerAccounts();
-    if (stateToken) {
-      hydrateTeacherRegistrationFromStateToken(stateToken, registrations, accounts);
-    }
-    const reg = registrations.find(
-      (r) =>
-        r.id.toLowerCase() === identifier ||
-        r.teacherUid.toLowerCase() === identifier ||
-        r.username.toLowerCase() === identifier ||
-        r.gmail.toLowerCase() === identifier ||
-        normalizePhoneE164(r.phone).toLowerCase() === normalizePhoneE164(identifier).toLowerCase()
-    );
-    if (!reg) {
-      sendJsonResponse(res, 404, {
-        found: false,
-        message: "Không tìm thấy hồ sơ đăng ký giáo viên."
-      });
-      return true;
-    }
-    const sanitizedReg = sanitizeRegistrationForClient(reg, classes, accounts);
-    sendJsonResponse(res, 200, {
-      found: true,
-      registration: sanitizedReg,
-      registrationStateToken: sanitizedReg.registrationStateToken,
-      emailProviderStatus: getEmailProviderStatus()
-    });
-    return true;
-  }
-
+  // Các endpoint /api/teacher-registration/* được xử lý thống nhất qua bộ định tuyến createApiApp()
   return false;
 }
 

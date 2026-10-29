@@ -886,7 +886,7 @@ export type TeacherApprovalStatus =
   | 'suspended';
 
 export interface StoredUserAccount {
-  id: string; // Stable immutable UID
+  id: string; // Stable immutable UID (Firebase UID)
   username: string;
   fullName: string;
   role: 'student' | 'teacher' | 'admin';
@@ -895,6 +895,7 @@ export interface StoredUserAccount {
   teacherUid?: string; // Owning teacher UID for student isolation
   email?: string;
   phone?: string;
+  firebasePhoneUid?: string;
   verificationMethod?: TeacherVerificationMethod;
   phoneVerified?: boolean;
   gmailVerified?: boolean;
@@ -917,6 +918,7 @@ export interface StoredUserAccount {
 export interface StoredTeacherRegistration {
   id: string;
   teacherUid: string;
+  firebasePhoneUid?: string;
   username: string;
   fullName: string;
   phone: string;
@@ -1063,6 +1065,12 @@ function extractBearerToken(req: Request): string | undefined {
   return undefined;
 }
 
+function ensureDataDirExists() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
 function loadServerAccounts(): StoredUserAccount[] {
   try {
     if (fs.existsSync(ACCOUNTS_FILE)) {
@@ -1078,11 +1086,17 @@ function loadServerAccounts(): StoredUserAccount[] {
   return [];
 }
 
-function saveServerAccounts(accounts: StoredUserAccount[]) {
+function saveServerAccounts(accounts: StoredUserAccount[], throwOnError = false): boolean {
   try {
+    ensureDataDirExists();
     fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), 'utf-8');
-  } catch (err) {
+    return true;
+  } catch (err: any) {
     console.error('Error saving server accounts:', err);
+    if (throwOnError) {
+      throw new Error(`Không thể lưu danh sách tài khoản trên máy chủ: ${err?.message || String(err)}`);
+    }
+    return false;
   }
 }
 
@@ -1099,11 +1113,17 @@ function loadTeacherRegistrations(): StoredTeacherRegistration[] {
   return [];
 }
 
-function saveTeacherRegistrations(list: StoredTeacherRegistration[]) {
+function saveTeacherRegistrations(list: StoredTeacherRegistration[], throwOnError = false): boolean {
   try {
+    ensureDataDirExists();
     fs.writeFileSync(TEACHER_REGISTRATIONS_FILE, JSON.stringify(list, null, 2), 'utf-8');
-  } catch (err) {
+    return true;
+  } catch (err: any) {
     console.error('Error saving teacher registrations:', err);
+    if (throwOnError) {
+      throw new Error(`Không thể lưu hồ sơ đăng ký giáo viên trên máy chủ: ${err?.message || String(err)}`);
+    }
+    return false;
   }
 }
 
@@ -1120,11 +1140,869 @@ function loadServerClasses(): StoredClassroomRecord[] {
   return [];
 }
 
-function saveServerClasses(list: StoredClassroomRecord[]) {
+function saveServerClasses(list: StoredClassroomRecord[], throwOnError = false): boolean {
   try {
+    ensureDataDirExists();
     fs.writeFileSync(CLASSES_FILE, JSON.stringify(list, null, 2), 'utf-8');
-  } catch (err) {
+    return true;
+  } catch (err: any) {
     console.error('Error saving classes:', err);
+    if (throwOnError) {
+      throw new Error(`Không thể lưu danh sách lớp học trên máy chủ: ${err?.message || String(err)}`);
+    }
+    return false;
+  }
+}
+
+// ============================================================================
+// UNIFIED CLOUD FIRESTORE + LOCAL STORAGE PERSISTENCE & RECONCILIATION
+// Uses existing collections: /teacher_registrations, /users, /admins, /classes, /student_rosters
+// ============================================================================
+let lastFirestoreHydrationTime = 0;
+let activeHydrationPromise: Promise<{
+  accounts: StoredUserAccount[];
+  registrations: StoredTeacherRegistration[];
+  classes: StoredClassroomRecord[];
+}> | null = null;
+
+function normalizeFirestoreTimestamp(val: any): string | undefined {
+  if (!val) return undefined;
+  if (typeof val === 'string') return val;
+  if (typeof val.toDate === 'function') {
+    try {
+      return val.toDate().toISOString();
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof val._seconds === 'number') {
+    return new Date(val._seconds * 1000).toISOString();
+  }
+  if (typeof val.seconds === 'number') {
+    return new Date(val.seconds * 1000).toISOString();
+  }
+  return String(val);
+}
+
+function buildFirestoreSafePayload(
+  rawObj: Record<string, any>,
+  FieldValueRef: any,
+  deleteIfUndefinedKeys: string[] = []
+): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [key, val] of Object.entries(rawObj || {})) {
+    if (val === undefined) {
+      if (
+        deleteIfUndefinedKeys.includes(key) &&
+        FieldValueRef &&
+        typeof FieldValueRef.delete === 'function'
+      ) {
+        out[key] = FieldValueRef.delete();
+      }
+      continue;
+    }
+    out[key] = val;
+  }
+  return out;
+}
+
+async function runServerFirestoreOp<T>(
+  operation: (db: any, FieldValue: any) => Promise<T>
+): Promise<{ executed: boolean; result?: T; error?: string }> {
+  const adminApp = ensureFirebaseAdminInitialized();
+  if (!adminApp) {
+    return { executed: false };
+  }
+  try {
+    const { getFirestore: getAdminFirestore, FieldValue } = await import(
+      'firebase-admin/firestore'
+    );
+    const appletConfig: any = getFirebaseProjectConfig();
+    const dbId = process.env.FIRESTORE_DATABASE_ID || appletConfig.firestoreDatabaseId;
+    try {
+      const db =
+        dbId && dbId !== '(default)'
+          ? getAdminFirestore(adminApp, dbId)
+          : getAdminFirestore(adminApp);
+      const result = await operation(db, FieldValue);
+      return { executed: true, result };
+    } catch (primaryErr) {
+      if (dbId && dbId !== '(default)') {
+        const defaultDb = getAdminFirestore(adminApp);
+        const result = await operation(defaultDb, FieldValue);
+        return { executed: true, result };
+      }
+      throw primaryErr;
+    }
+  } catch (err: any) {
+    console.warn('[FirestoreSync] Lỗi thao tác Cloud Firestore:', err?.message || err);
+    return { executed: false, error: err?.message || String(err) };
+  }
+}
+
+async function resolveOrCreateTeacherFirebaseUid(params: {
+  gmail?: string;
+  email?: string;
+  phone: string;
+  fullName: string;
+  password?: string;
+  firebaseIdToken?: string;
+  existingUid?: string;
+}): Promise<string> {
+  const targetEmail = String(params.gmail || params.email || '').trim().toLowerCase();
+
+  if (params.firebaseIdToken && typeof params.firebaseIdToken === 'string') {
+    const verified = await verifyFirebaseIdTokenOnServer(params.firebaseIdToken);
+    if (verified.valid && verified.uid) {
+      return verified.uid;
+    }
+  }
+
+  const adminApp = ensureFirebaseAdminInitialized();
+  if (adminApp) {
+    try {
+      const { getAuth: getAdminAuth } = await import('firebase-admin/auth');
+      const adminAuth = getAdminAuth(adminApp);
+      const normalizedPhone = params.phone ? normalizePhoneE164(params.phone) : '';
+
+      if (targetEmail) {
+        try {
+          const userByEmail = await adminAuth.getUserByEmail(targetEmail);
+          if (userByEmail?.uid) return userByEmail.uid;
+        } catch {
+          // user not found by email
+        }
+      }
+
+      if (normalizedPhone) {
+        try {
+          const userByPhone = await adminAuth.getUserByPhoneNumber(normalizedPhone);
+          if (userByPhone?.uid) return userByPhone.uid;
+        } catch {
+          // user not found by phone
+        }
+      }
+
+      if (targetEmail && params.password && String(params.password).length >= 6) {
+        try {
+          const createdUser = await adminAuth.createUser({
+            email: targetEmail,
+            password: String(params.password),
+            displayName: String(params.fullName || '').trim() || undefined
+          });
+          if (createdUser?.uid) return createdUser.uid;
+        } catch {
+          // fallback below if creation fails
+        }
+      }
+    } catch {
+      // ignore and fall back
+    }
+  }
+
+  if (
+    params.existingUid &&
+    typeof params.existingUid === 'string' &&
+    !params.existingUid.startsWith('teacher-')
+  ) {
+    return params.existingUid;
+  }
+
+  const cleanPhone = params.phone ? normalizePhoneE164(params.phone) : '';
+  const digest = crypto
+    .createHash('sha256')
+    .update(`vanai12_teacher_uid:${targetEmail}:${cleanPhone}`)
+    .digest('hex')
+    .slice(0, 20);
+  return `fb-gv-${digest}`;
+}
+
+function normalizeUnifiedTeacherPair(
+  reg: StoredTeacherRegistration | undefined,
+  acc: StoredUserAccount | undefined
+): {
+  changed: boolean;
+  phoneVerified: boolean;
+  gmailVerified: boolean;
+  isOwnershipVerified: boolean;
+  approvalStatus: TeacherApprovalStatus;
+} {
+  let changed = false;
+
+  const phoneVerified = Boolean(reg?.phoneVerified || acc?.phoneVerified);
+  const gmailVerified = Boolean(reg?.gmailVerified || acc?.gmailVerified);
+  const isOwnershipVerified = Boolean(
+    reg?.isOwnershipVerified || phoneVerified || gmailVerified
+  );
+
+  let unifiedStatus: TeacherApprovalStatus =
+    reg?.approvalStatus || acc?.teacherApprovalStatus || 'pending_verification';
+
+  if (reg?.approvalStatus === 'approved' || acc?.teacherApprovalStatus === 'approved') {
+    unifiedStatus = 'approved';
+  } else if (reg?.approvalStatus === 'suspended' || acc?.teacherApprovalStatus === 'suspended') {
+    unifiedStatus = 'suspended';
+  } else if (reg?.approvalStatus === 'rejected' || acc?.teacherApprovalStatus === 'rejected') {
+    unifiedStatus = 'rejected';
+  } else if (
+    reg?.approvalStatus === 'pending_admin_approval' ||
+    acc?.teacherApprovalStatus === 'pending_admin_approval' ||
+    isOwnershipVerified
+  ) {
+    unifiedStatus = 'pending_admin_approval';
+  } else {
+    unifiedStatus = 'pending_verification';
+  }
+
+  const unifiedAccountStatus: 'active' | 'pending_activation' | 'locked' =
+    unifiedStatus === 'approved'
+      ? 'active'
+      : unifiedStatus === 'rejected' || unifiedStatus === 'suspended'
+      ? 'locked'
+      : 'pending_activation';
+
+  if (reg) {
+    if (reg.phoneVerified !== phoneVerified) {
+      reg.phoneVerified = phoneVerified;
+      changed = true;
+    }
+    if (reg.gmailVerified !== gmailVerified) {
+      reg.gmailVerified = gmailVerified;
+      changed = true;
+    }
+    if (reg.isOwnershipVerified !== isOwnershipVerified) {
+      reg.isOwnershipVerified = isOwnershipVerified;
+      changed = true;
+    }
+    if (reg.approvalStatus !== unifiedStatus) {
+      reg.approvalStatus = unifiedStatus;
+      changed = true;
+    }
+  }
+
+  if (acc && acc.role === 'teacher') {
+    if (acc.phoneVerified !== phoneVerified) {
+      acc.phoneVerified = phoneVerified;
+      changed = true;
+    }
+    if (acc.gmailVerified !== gmailVerified) {
+      acc.gmailVerified = gmailVerified;
+      changed = true;
+    }
+    if (acc.teacherApprovalStatus !== unifiedStatus) {
+      acc.teacherApprovalStatus = unifiedStatus;
+      changed = true;
+    }
+    if (acc.status !== unifiedAccountStatus) {
+      acc.status = unifiedAccountStatus;
+      changed = true;
+    }
+    if (unifiedStatus === 'approved' && !acc.isActivated) {
+      acc.isActivated = true;
+      changed = true;
+    }
+  }
+
+  return {
+    changed,
+    phoneVerified,
+    gmailVerified,
+    isOwnershipVerified,
+    approvalStatus: unifiedStatus
+  };
+}
+
+function reconcileTeacherRegistrationAndAccountStates(
+  registrations: StoredTeacherRegistration[],
+  accounts: StoredUserAccount[]
+): {
+  regChanged: boolean;
+  accChanged: boolean;
+  registrations: StoredTeacherRegistration[];
+  accounts: StoredUserAccount[];
+} {
+  let regChanged = false;
+  let accChanged = false;
+  const now = new Date().toISOString();
+
+  for (const reg of registrations) {
+    let acc = accounts.find(
+      (a) =>
+        a.role === 'teacher' &&
+        (a.id === reg.teacherUid ||
+          (a.username && reg.username && a.username.toUpperCase() === reg.username.toUpperCase()) ||
+          (a.email && reg.gmail && a.email.toLowerCase() === reg.gmail.toLowerCase()))
+    );
+    if (!acc) {
+      const salt = generateSaltServer();
+      acc = {
+        id: reg.teacherUid,
+        username: reg.username || `GV-${String(reg.phone || '').slice(-6)}`,
+        fullName: reg.fullName,
+        role: 'teacher',
+        email: reg.gmail,
+        phone: reg.phone,
+        verificationMethod: reg.verificationMethod || 'phone_otp',
+        phoneVerified: Boolean(reg.phoneVerified),
+        gmailVerified: Boolean(reg.gmailVerified),
+        teacherApprovalStatus: reg.approvalStatus || 'pending_verification',
+        rejectionReason: reg.rejectionReason,
+        reviewedByUid: reg.reviewedByUid,
+        reviewedByName: reg.reviewedByName,
+        reviewedAt: reg.reviewedAt,
+        isActivated: true,
+        passwordSalt: salt,
+        passwordHash: hashPasswordServer(crypto.randomBytes(16).toString('hex'), salt),
+        createdAt: reg.createdAt || now,
+        status: reg.approvalStatus === 'approved' ? 'active' : 'pending_activation',
+        notes: 'Đồng bộ từ hồ sơ đăng ký Giáo viên'
+      };
+      accounts.push(acc);
+      accChanged = true;
+    } else if (acc.id !== reg.teacherUid) {
+      if (!reg.teacherUid.startsWith('teacher-') && acc.id.startsWith('teacher-')) {
+        acc.id = reg.teacherUid;
+        accChanged = true;
+      } else if (reg.teacherUid.startsWith('teacher-') && !acc.id.startsWith('teacher-')) {
+        reg.teacherUid = acc.id;
+        regChanged = true;
+      }
+    }
+    if (normalizeUnifiedTeacherPair(reg, acc).changed) {
+      regChanged = true;
+      accChanged = true;
+    }
+  }
+
+  for (const acc of accounts) {
+    if (acc.role !== 'teacher') continue;
+    let reg = registrations.find(
+      (r) =>
+        r.teacherUid === acc.id ||
+        (r.username && acc.username && r.username.toUpperCase() === acc.username.toUpperCase()) ||
+        (r.gmail && acc.email && r.gmail.toLowerCase() === acc.email.toLowerCase())
+    );
+    if (!reg) {
+      reg = {
+        id: `treg-${acc.id}`,
+        teacherUid: acc.id,
+        username: acc.username,
+        fullName: acc.fullName,
+        phone: acc.phone || '',
+        gmail: acc.email || '',
+        verificationMethod: acc.verificationMethod || 'phone_otp',
+        phoneVerified: Boolean(acc.phoneVerified),
+        gmailVerified: Boolean(acc.gmailVerified),
+        isOwnershipVerified: Boolean(acc.phoneVerified || acc.gmailVerified),
+        approvalStatus: acc.teacherApprovalStatus || 'pending_verification',
+        rejectionReason: acc.rejectionReason,
+        reviewedByUid: acc.reviewedByUid,
+        reviewedByName: acc.reviewedByName,
+        reviewedAt: acc.reviewedAt,
+        createdAt: acc.createdAt || now,
+        updatedAt: acc.createdAt || now
+      };
+      normalizeUnifiedTeacherPair(reg, acc);
+      registrations.unshift(reg);
+      regChanged = true;
+      accChanged = true;
+    } else if (normalizeUnifiedTeacherPair(reg, acc).changed) {
+      regChanged = true;
+      accChanged = true;
+    }
+  }
+
+  return { regChanged, accChanged, registrations, accounts };
+}
+
+async function hydrateServerStateFromFirestore(force = false): Promise<{
+  accounts: StoredUserAccount[];
+  registrations: StoredTeacherRegistration[];
+  classes: StoredClassroomRecord[];
+}> {
+  const nowMs = Date.now();
+  if (!force && nowMs - lastFirestoreHydrationTime < 2500) {
+    const localAccounts = loadServerAccounts();
+    const localRegistrations = loadTeacherRegistrations();
+    const localClasses = loadServerClasses();
+    const reconciled = reconcileTeacherRegistrationAndAccountStates(
+      localRegistrations,
+      localAccounts
+    );
+    if (reconciled.regChanged) saveTeacherRegistrations(localRegistrations);
+    if (reconciled.accChanged) saveServerAccounts(localAccounts);
+    return {
+      accounts: localAccounts,
+      registrations: localRegistrations,
+      classes: localClasses
+    };
+  }
+  if (activeHydrationPromise) {
+    return activeHydrationPromise;
+  }
+
+  activeHydrationPromise = (async () => {
+    const localAccounts = loadServerAccounts();
+    const localRegistrations = loadTeacherRegistrations();
+    const localClasses = loadServerClasses();
+    try {
+      const op = await runServerFirestoreOp(async (db) => {
+        const [regSnap, usersSnap, classesSnap] = await Promise.all([
+          db.collection('teacher_registrations').get(),
+          db.collection('users').get(),
+          db.collection('classes').get()
+        ]);
+        return {
+          regDocs: regSnap.docs.map((d: any) => ({ id: d.id, ...d.data() })),
+          userDocs: usersSnap.docs.map((d: any) => ({ id: d.id, ...d.data() })),
+          classDocs: classesSnap.docs.map((d: any) => ({ id: d.id, ...d.data() }))
+        };
+      });
+
+      if (!op.executed || !op.result) {
+        const { regChanged, accChanged } = reconcileTeacherRegistrationAndAccountStates(
+          localRegistrations,
+          localAccounts
+        );
+        if (regChanged) saveTeacherRegistrations(localRegistrations);
+        if (accChanged) saveServerAccounts(localAccounts);
+        lastFirestoreHydrationTime = Date.now();
+        return {
+          accounts: localAccounts,
+          registrations: localRegistrations,
+          classes: localClasses
+        };
+      }
+
+      const { regDocs, userDocs, classDocs } = op.result;
+      let accountsChanged = false;
+      let registrationsChanged = false;
+      let classesChanged = false;
+
+      // 1. Merge /teacher_registrations
+      const regByUid = new Map<string, StoredTeacherRegistration>();
+      for (const r of localRegistrations) {
+        regByUid.set(r.teacherUid || r.id, r);
+      }
+      for (const doc of regDocs) {
+        const teacherUid = String(doc.teacherUid || doc.id || '').trim();
+        if (!teacherUid) continue;
+        const normalizedDoc: StoredTeacherRegistration = {
+          id: String(doc.id || `treg-${teacherUid}`),
+          teacherUid,
+          username: String(doc.username || '').trim().toUpperCase(),
+          fullName: String(doc.fullName || '').trim(),
+          phone: String(doc.phone || '').trim(),
+          gmail: String(doc.gmail || '').trim().toLowerCase(),
+          verificationMethod: doc.verificationMethod === 'gmail_otp' ? 'gmail_otp' : 'phone_otp',
+          phoneVerified: Boolean(doc.phoneVerified),
+          phoneVerifiedAt: normalizeFirestoreTimestamp(doc.phoneVerifiedAt),
+          gmailVerified: Boolean(doc.gmailVerified),
+          gmailVerifiedAt: normalizeFirestoreTimestamp(doc.gmailVerifiedAt),
+          gmailOtpHash: doc.gmailOtpHash || undefined,
+          gmailOtpSalt: doc.gmailOtpSalt || undefined,
+          gmailOtpExpiresAt: normalizeFirestoreTimestamp(doc.gmailOtpExpiresAt),
+          gmailOtpAttempts: typeof doc.gmailOtpAttempts === 'number' ? doc.gmailOtpAttempts : 0,
+          lastOtpSentAt: normalizeFirestoreTimestamp(doc.lastOtpSentAt),
+          isOwnershipVerified: Boolean(
+            doc.isOwnershipVerified || doc.phoneVerified || doc.gmailVerified
+          ),
+          approvalStatus: (doc.approvalStatus || 'pending_verification') as TeacherApprovalStatus,
+          rejectionReason: doc.rejectionReason || undefined,
+          suspensionReason: doc.suspensionReason || undefined,
+          reviewedByUid: doc.reviewedByUid || undefined,
+          reviewedByName: doc.reviewedByName || undefined,
+          reviewedAt: normalizeFirestoreTimestamp(doc.reviewedAt),
+          createdAt: normalizeFirestoreTimestamp(doc.createdAt) || new Date().toISOString(),
+          updatedAt: normalizeFirestoreTimestamp(doc.updatedAt) || new Date().toISOString()
+        };
+
+        const existing =
+          regByUid.get(teacherUid) ||
+          localRegistrations.find(
+            (r) =>
+              r.id === normalizedDoc.id ||
+              (r.username &&
+                normalizedDoc.username &&
+                r.username.toUpperCase() === normalizedDoc.username) ||
+              (r.gmail && normalizedDoc.gmail && r.gmail.toLowerCase() === normalizedDoc.gmail)
+          );
+
+        if (!existing) {
+          localRegistrations.unshift(normalizedDoc);
+          regByUid.set(teacherUid, normalizedDoc);
+          registrationsChanged = true;
+        } else {
+          const remoteTime = new Date(normalizedDoc.updatedAt || 0).getTime();
+          const localTime = new Date(existing.updatedAt || 0).getTime();
+          if (
+            remoteTime >= localTime ||
+            normalizedDoc.approvalStatus === 'approved' ||
+            (normalizedDoc.isOwnershipVerified && !existing.isOwnershipVerified)
+          ) {
+            Object.assign(existing, {
+              ...existing,
+              ...normalizedDoc,
+              gmailOtpHash: normalizedDoc.gmailOtpHash ?? existing.gmailOtpHash,
+              gmailOtpSalt: normalizedDoc.gmailOtpSalt ?? existing.gmailOtpSalt,
+              gmailOtpExpiresAt: normalizedDoc.gmailOtpExpiresAt ?? existing.gmailOtpExpiresAt
+            });
+            registrationsChanged = true;
+          }
+        }
+      }
+
+      // 2. Merge /users
+      for (const doc of userDocs) {
+        const uid = String(doc.uid || doc.id || '').trim();
+        if (!uid) continue;
+        const normalizedUser: StoredUserAccount = {
+          id: uid,
+          username: String(doc.username || '').trim().toUpperCase(),
+          fullName: String(doc.fullName || '').trim(),
+          role:
+            doc.role === 'admin' ? 'admin' : doc.role === 'teacher' ? 'teacher' : 'student',
+          className: doc.className || undefined,
+          classId: doc.classId || undefined,
+          teacherUid: doc.teacherUid || undefined,
+          email: doc.email ? String(doc.email).trim().toLowerCase() : undefined,
+          phone: doc.phone || undefined,
+          verificationMethod: doc.verificationMethod || undefined,
+          phoneVerified:
+            typeof doc.phoneVerified === 'boolean' ? doc.phoneVerified : undefined,
+          gmailVerified:
+            typeof doc.gmailVerified === 'boolean' ? doc.gmailVerified : undefined,
+          teacherApprovalStatus: doc.teacherApprovalStatus || undefined,
+          rejectionReason: doc.rejectionReason || undefined,
+          reviewedByUid: doc.reviewedByUid || undefined,
+          reviewedByName: doc.reviewedByName || undefined,
+          reviewedAt: normalizeFirestoreTimestamp(doc.reviewedAt),
+          passwordHash: doc.passwordHash || undefined,
+          passwordSalt: doc.passwordSalt || undefined,
+          activationCode: doc.activationCode || undefined,
+          activationCodeExpiresAt: normalizeFirestoreTimestamp(doc.activationCodeExpiresAt),
+          isActivated: doc.isActivated !== undefined ? Boolean(doc.isActivated) : true,
+          createdAt: normalizeFirestoreTimestamp(doc.createdAt) || new Date().toISOString(),
+          lastLoginAt: normalizeFirestoreTimestamp(doc.lastLoginAt),
+          status:
+            doc.status === 'active' || doc.status === 'locked'
+              ? doc.status
+              : 'pending_activation',
+          notes: doc.notes || undefined
+        };
+
+        const existing = localAccounts.find(
+          (a) =>
+            a.id === uid ||
+            (a.username &&
+              normalizedUser.username &&
+              a.role === normalizedUser.role &&
+              a.username.toUpperCase() === normalizedUser.username)
+        );
+        if (!existing) {
+          localAccounts.push(normalizedUser);
+          accountsChanged = true;
+        } else {
+          Object.assign(existing, {
+            ...existing,
+            ...normalizedUser,
+            passwordHash: normalizedUser.passwordHash || existing.passwordHash,
+            passwordSalt: normalizedUser.passwordSalt || existing.passwordSalt
+          });
+          accountsChanged = true;
+        }
+      }
+
+      // 3. Merge /classes
+      for (const doc of classDocs) {
+        const classId = String(doc.id || '').trim();
+        if (!classId) continue;
+        const normalizedClass: StoredClassroomRecord = {
+          id: classId,
+          name: String(doc.name || '').trim().toUpperCase(),
+          teacherUid: String(doc.teacherUid || '').trim(),
+          teacherName: String(doc.teacherName || '').trim(),
+          status: doc.status === 'archived' ? 'archived' : 'active',
+          enrolledCount: typeof doc.enrolledCount === 'number' ? doc.enrolledCount : 0,
+          maxCapacity:
+            typeof doc.maxCapacity === 'number'
+              ? doc.maxCapacity
+              : MAX_ENROLLED_STUDENTS_PER_CLASS,
+          createdAt: normalizeFirestoreTimestamp(doc.createdAt) || new Date().toISOString(),
+          updatedAt: normalizeFirestoreTimestamp(doc.updatedAt) || new Date().toISOString()
+        };
+        const existingCls = localClasses.find((c) => c.id === classId);
+        if (!existingCls) {
+          localClasses.push(normalizedClass);
+          classesChanged = true;
+        } else {
+          const remoteTime = new Date(normalizedClass.updatedAt || 0).getTime();
+          const localTime = new Date(existingCls.updatedAt || 0).getTime();
+          if (remoteTime >= localTime) {
+            Object.assign(existingCls, normalizedClass);
+            classesChanged = true;
+          }
+        }
+      }
+
+      const reconciled = reconcileTeacherRegistrationAndAccountStates(
+        localRegistrations,
+        localAccounts
+      );
+      if (registrationsChanged || reconciled.regChanged) {
+        saveTeacherRegistrations(localRegistrations);
+      }
+      if (accountsChanged || reconciled.accChanged) {
+        saveServerAccounts(localAccounts);
+      }
+      if (classesChanged) {
+        saveServerClasses(localClasses);
+      }
+
+      lastFirestoreHydrationTime = Date.now();
+      return {
+        accounts: localAccounts,
+        registrations: localRegistrations,
+        classes: localClasses
+      };
+    } catch (err) {
+      console.warn('[FirestoreSync] Lỗi đồng bộ từ Firestore:', err);
+      return {
+        accounts: localAccounts,
+        registrations: localRegistrations,
+        classes: localClasses
+      };
+    } finally {
+      activeHydrationPromise = null;
+    }
+  })();
+
+  return activeHydrationPromise;
+}
+
+async function migrateTeacherUidAcrossCollections(
+  oldUid: string,
+  newUid: string,
+  registrations: StoredTeacherRegistration[],
+  accounts: StoredUserAccount[],
+  classes: StoredClassroomRecord[]
+): Promise<boolean> {
+  if (!oldUid || !newUid || oldUid === newUid) return false;
+  let migrated = false;
+
+  for (const reg of registrations) {
+    if (reg.teacherUid === oldUid) {
+      reg.teacherUid = newUid;
+      if (reg.id === `treg-${oldUid}`) {
+        reg.id = `treg-${newUid}`;
+      }
+      migrated = true;
+    }
+  }
+  for (const acc of accounts) {
+    if (acc.id === oldUid && acc.role === 'teacher') {
+      acc.id = newUid;
+      migrated = true;
+    }
+    if (acc.role === 'student' && acc.teacherUid === oldUid) {
+      acc.teacherUid = newUid;
+      migrated = true;
+    }
+  }
+  for (const cls of classes) {
+    if (cls.teacherUid === oldUid) {
+      cls.teacherUid = newUid;
+      migrated = true;
+    }
+  }
+  if (migrated) {
+    saveTeacherRegistrations(registrations);
+    saveServerAccounts(accounts);
+    saveServerClasses(classes);
+  }
+  return migrated;
+}
+
+async function persistTeacherRegistrationAndAccount(
+  reg: StoredTeacherRegistration | undefined,
+  teacherAcc: StoredUserAccount | undefined,
+  registrations: StoredTeacherRegistration[],
+  accounts: StoredUserAccount[],
+  options: { oldTeacherUid?: string } = {}
+): Promise<{ saved: boolean; error?: string }> {
+  try {
+    normalizeUnifiedTeacherPair(reg, teacherAcc);
+
+    const savedRegs = saveTeacherRegistrations(registrations, false);
+    const savedAccs = saveServerAccounts(accounts, false);
+    if (!savedRegs || !savedAccs) {
+      return {
+        saved: false,
+        error: 'Không thể ghi dữ liệu hồ sơ giáo viên vào bộ nhớ máy chủ.'
+      };
+    }
+
+    const firestoreSync = await runServerFirestoreOp(async (db, FieldValue) => {
+      const batch = db.batch();
+      const targetTeacherUid = reg?.teacherUid || teacherAcc?.id;
+
+      if (
+        options.oldTeacherUid &&
+        targetTeacherUid &&
+        options.oldTeacherUid !== targetTeacherUid
+      ) {
+        batch.delete(db.collection('teacher_registrations').doc(options.oldTeacherUid));
+        batch.delete(db.collection('users').doc(options.oldTeacherUid));
+      }
+
+      if (reg && reg.teacherUid) {
+        const regDocRef = db.collection('teacher_registrations').doc(reg.teacherUid);
+        if (reg.id && reg.id !== reg.teacherUid) {
+          batch.delete(db.collection('teacher_registrations').doc(reg.id));
+        }
+        const safeRegPayload = buildFirestoreSafePayload(
+          {
+            ...reg,
+            updatedAt: reg.updatedAt || new Date().toISOString()
+          },
+          FieldValue,
+          [
+            'gmailOtpHash',
+            'gmailOtpSalt',
+            'gmailOtpExpiresAt',
+            'rejectionReason',
+            'suspensionReason'
+          ]
+        );
+        batch.set(regDocRef, safeRegPayload, { merge: true });
+      }
+
+      if (teacherAcc && teacherAcc.id) {
+        const userDocRef = db.collection('users').doc(teacherAcc.id);
+        const safeUserPayload = buildFirestoreSafePayload(
+          {
+            ...teacherAcc,
+            uid: teacherAcc.id,
+            updatedAt: new Date().toISOString()
+          },
+          FieldValue,
+          ['rejectionReason', 'activationCode', 'activationCodeExpiresAt']
+        );
+        batch.set(userDocRef, safeUserPayload, { merge: true });
+      }
+
+      await batch.commit();
+    });
+
+    if (firestoreSync.error) {
+      console.warn(
+        '[FirestoreSync] Cảnh báo khi đồng bộ hồ sơ giáo viên lên Cloud Firestore:',
+        firestoreSync.error
+      );
+    }
+
+    return { saved: true };
+  } catch (err: any) {
+    return {
+      saved: false,
+      error: err?.message || 'Lỗi khi lưu hồ sơ giáo viên.'
+    };
+  }
+}
+
+async function persistClassroomToStores(
+  cls: StoredClassroomRecord,
+  classes: StoredClassroomRecord[]
+): Promise<{ saved: boolean; error?: string }> {
+  try {
+    const savedLocal = saveServerClasses(classes, false);
+    if (!savedLocal) {
+      return {
+        saved: false,
+        error: 'Không thể lưu dữ liệu lớp học trên máy chủ.'
+      };
+    }
+    const firestoreSync = await runServerFirestoreOp(async (db, FieldValue) => {
+      const docRef = db.collection('classes').doc(cls.id);
+      const safePayload = buildFirestoreSafePayload({ ...cls }, FieldValue);
+      await docRef.set(safePayload, { merge: true });
+    });
+    if (firestoreSync.error) {
+      console.warn('[FirestoreSync] Cảnh báo lưu lớp học lên Firestore:', firestoreSync.error);
+    }
+    return { saved: true };
+  } catch (err: any) {
+    return {
+      saved: false,
+      error: err?.message || 'Lỗi khi lưu lớp học.'
+    };
+  }
+}
+
+async function persistStudentAccountToStores(
+  studentAcc: StoredUserAccount,
+  accounts: StoredUserAccount[],
+  targetClass?: StoredClassroomRecord,
+  classes?: StoredClassroomRecord[]
+): Promise<{ saved: boolean; error?: string }> {
+  try {
+    const savedAccs = saveServerAccounts(accounts, false);
+    if (!savedAccs) {
+      return {
+        saved: false,
+        error: 'Không thể lưu tài khoản học sinh trên máy chủ.'
+      };
+    }
+    if (classes) {
+      saveServerClasses(classes, false);
+    }
+    await runServerFirestoreOp(async (db, FieldValue) => {
+      const batch = db.batch();
+      if (studentAcc && studentAcc.id) {
+        const userRef = db.collection('users').doc(studentAcc.id);
+        batch.set(
+          userRef,
+          buildFirestoreSafePayload({ ...studentAcc, uid: studentAcc.id }, FieldValue, [
+            'activationCode',
+            'activationCodeExpiresAt'
+          ]),
+          { merge: true }
+        );
+        const rosterRef = db.collection('student_rosters').doc(studentAcc.id);
+        batch.set(
+          rosterRef,
+          buildFirestoreSafePayload(
+            {
+              id: studentAcc.id,
+              username: studentAcc.username,
+              fullName: studentAcc.fullName,
+              className: studentAcc.className || targetClass?.name || '',
+              classId: studentAcc.classId || targetClass?.id || '',
+              teacherUid: studentAcc.teacherUid || targetClass?.teacherUid || '',
+              email: studentAcc.email,
+              isActivated: Boolean(studentAcc.isActivated),
+              status: studentAcc.status,
+              createdAt: studentAcc.createdAt
+            },
+            FieldValue
+          ),
+          { merge: true }
+        );
+      }
+      if (targetClass && targetClass.id) {
+        const clsRef = db.collection('classes').doc(targetClass.id);
+        batch.set(clsRef, buildFirestoreSafePayload({ ...targetClass }, FieldValue), {
+          merge: true
+        });
+      }
+      await batch.commit();
+    });
+    return { saved: true };
+  } catch (err: any) {
+    return {
+      saved: false,
+      error: err?.message || 'Lỗi khi lưu tài khoản học sinh.'
+    };
   }
 }
 
@@ -1143,6 +2021,7 @@ function loadAdminAuditLogs(): StoredAdminAuditLog[] {
 
 function saveAdminAuditLogs(logs: StoredAdminAuditLog[]) {
   try {
+    ensureDataDirExists();
     fs.writeFileSync(ADMIN_AUDIT_LOGS_FILE, JSON.stringify(logs, null, 2), 'utf-8');
   } catch (err) {
     console.error('Error saving audit logs:', err);
@@ -1775,8 +2654,20 @@ async function verifyFirebasePhoneIdTokenOnServer(
 function resolveOrHydrateVerifiedSessionUser(
   verified: SessionTokenPayload
 ): StoredUserAccount | undefined {
-  const accounts = loadServerAccounts();
-  let dbUser = accounts.find((a) => a.id === verified.uid);
+  let accounts = loadServerAccounts();
+  let registrations = loadTeacherRegistrations();
+  const reconciled = reconcileTeacherRegistrationAndAccountStates(registrations, accounts);
+  accounts = reconciled.accounts;
+  registrations = reconciled.registrations;
+
+  let dbUser = accounts.find(
+    (a) =>
+      a.id === verified.uid ||
+      (a as any).firebasePhoneUid === verified.uid ||
+      (verified.username &&
+        a.role === verified.role &&
+        a.username.toUpperCase() === String(verified.username).toUpperCase())
+  );
   const configuredFirstAdminUid = getConfiguredFirstAdminUid();
   if (
     !dbUser &&
@@ -1804,7 +2695,19 @@ function resolveOrHydrateVerifiedSessionUser(
   return dbUser;
 }
 
-function requireAuth(req: Request, res: Response, next: NextFunction) {
+async function resolveOrHydrateVerifiedSessionUserAsync(
+  verified: SessionTokenPayload
+): Promise<StoredUserAccount | undefined> {
+  await hydrateServerStateFromFirestore(false);
+  let dbUser = resolveOrHydrateVerifiedSessionUser(verified);
+  if (!dbUser || (dbUser.role === 'teacher' && dbUser.teacherApprovalStatus !== 'approved')) {
+    await hydrateServerStateFromFirestore(true);
+    dbUser = resolveOrHydrateVerifiedSessionUser(verified);
+  }
+  return dbUser;
+}
+
+async function requireAuth(req: Request, res: Response, next: NextFunction) {
   const token = extractBearerToken(req);
   const verified = verifySessionToken(token);
   if (!verified) {
@@ -1813,19 +2716,24 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
     });
     return;
   }
-  const dbUser = resolveOrHydrateVerifiedSessionUser(verified);
+  const dbUser = await resolveOrHydrateVerifiedSessionUserAsync(verified);
   if (!dbUser || dbUser.status === 'locked') {
     res.status(403).json({
       error: 'Tài khoản không tồn tại hoặc đã bị khóa.'
     });
     return;
   }
-  (req as any).authSession = verified;
+  (req as any).authSession = {
+    ...verified,
+    uid: dbUser.id,
+    role: dbUser.role,
+    username: dbUser.username
+  };
   (req as any).authUser = dbUser;
   next();
 }
 
-function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
+async function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
   const token = extractBearerToken(req);
   const verified = verifySessionToken(token);
   if (!verified) {
@@ -1848,19 +2756,24 @@ function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
     });
     return;
   }
-  const dbUser = resolveOrHydrateVerifiedSessionUser(verified);
+  const dbUser = await resolveOrHydrateVerifiedSessionUserAsync(verified);
   if (!dbUser || dbUser.role !== 'admin' || dbUser.status !== 'active') {
     res.status(403).json({
       error: 'Từ chối truy cập (403): Tài khoản Quản trị viên không hợp lệ hoặc đã bị khóa.'
     });
     return;
   }
-  (req as any).authSession = verified;
+  (req as any).authSession = {
+    ...verified,
+    uid: dbUser.id,
+    role: dbUser.role,
+    username: dbUser.username
+  };
   (req as any).authUser = dbUser;
   next();
 }
 
-function requireTeacherAuth(req: Request, res: Response, next: NextFunction) {
+async function requireTeacherAuth(req: Request, res: Response, next: NextFunction) {
   const token = extractBearerToken(req);
   const verified = verifySessionToken(token);
   if (!verified) {
@@ -1876,23 +2789,43 @@ function requireTeacherAuth(req: Request, res: Response, next: NextFunction) {
     return;
   }
 
-  const dbUser = resolveOrHydrateVerifiedSessionUser(verified);
-  if (!dbUser || dbUser.status !== 'active') {
+  const dbUser = await resolveOrHydrateVerifiedSessionUserAsync(verified);
+  if (!dbUser) {
     res.status(403).json({
-      error: 'Từ chối truy cập (403): Tài khoản không hợp lệ hoặc đang bị tạm khóa.'
+      error:
+        'Từ chối truy cập (403): Không tìm thấy hồ sơ Giáo viên hợp lệ trên hệ thống. Vui lòng đăng nhập lại.'
     });
     return;
   }
 
   if (dbUser.role === 'teacher' && dbUser.teacherApprovalStatus !== 'approved') {
+    const statusDesc =
+      dbUser.teacherApprovalStatus === 'pending_verification'
+        ? 'Hồ sơ của bạn chưa hoàn tất xác minh OTP (Số điện thoại hoặc Gmail).'
+        : dbUser.teacherApprovalStatus === 'pending_admin_approval'
+        ? 'Hồ sơ của bạn đã xác minh OTP và đang ở trạng thái "Chờ Quản trị viên phê duyệt".'
+        : dbUser.teacherApprovalStatus === 'rejected'
+        ? `Hồ sơ của bạn đã bị Quản trị viên từ chối${dbUser.rejectionReason ? `: ${dbUser.rejectionReason}` : '.'}`
+        : 'Tài khoản Giáo viên đang bị tạm khóa.';
     res.status(403).json({
-      error:
-        'Từ chối truy cập (403): Tài khoản Giáo viên chưa được Quản trị viên phê duyệt. Chỉ giáo viên đã xác minh OTP và được Quản trị viên duyệt mới được sử dụng khu vực giáo viên.'
+      error: `Từ chối truy cập (403): Tài khoản Giáo viên chưa được Quản trị viên phê duyệt (${statusDesc}) Chỉ giáo viên đã xác minh OTP và được Quản trị viên duyệt mới được tạo lớp và sử dụng khu vực Giáo viên.`
     });
     return;
   }
 
-  (req as any).authSession = verified;
+  if (dbUser.status !== 'active') {
+    res.status(403).json({
+      error: 'Từ chối truy cập (403): Tài khoản đang bị tạm khóa hoặc chưa kích hoạt.'
+    });
+    return;
+  }
+
+  (req as any).authSession = {
+    ...verified,
+    uid: dbUser.id,
+    role: dbUser.role,
+    username: dbUser.username
+  };
   (req as any).authUser = dbUser;
   next();
 }
@@ -1928,6 +2861,8 @@ function sanitizeRegistrationForClient(
   accounts: StoredUserAccount[]
 ) {
   const { gmailOtpHash, gmailOtpSalt, ...safe } = reg;
+  const teacherAcc = accounts.find((a) => a.id === reg.teacherUid && a.role === 'teacher');
+  const unifiedPair = normalizeUnifiedTeacherPair(reg, teacherAcc);
   const teacherClasses = classes
     .filter((c) => c.teacherUid === reg.teacherUid)
     .map((c) => enrichClassroomForClient(c, accounts));
@@ -1938,6 +2873,10 @@ function sanitizeRegistrationForClient(
 
   return {
     ...safe,
+    phoneVerified: unifiedPair.phoneVerified,
+    gmailVerified: unifiedPair.gmailVerified,
+    isOwnershipVerified: unifiedPair.isOwnershipVerified,
+    approvalStatus: unifiedPair.approvalStatus,
     activeClassesCount,
     remainingClassesQuota: Math.max(0, MAX_ACTIVE_CLASSES_PER_TEACHER - activeClassesCount),
     totalEnrolledStudentsCount,
@@ -2126,7 +3065,7 @@ export function createApiApp(): express.Express {
   // ==========================================================================
   // 1B. TEACHER REGISTRATION & OWNERSHIP VERIFICATION (PHONE OTP / GMAIL OTP)
   // ==========================================================================
-  app.post('/api/teacher-registration/submit', (req, res) => {
+  app.post('/api/teacher-registration/submit', async (req, res) => {
     const { username, fullName, phone, gmail, password, verificationMethod } = req.body || {};
 
     if (!fullName || !phone || !gmail || !password) {
@@ -2166,15 +3105,16 @@ export function createApiApp(): express.Express {
     const method: TeacherVerificationMethod =
       verificationMethod === 'gmail_otp' ? 'gmail_otp' : 'phone_otp';
 
-    const accounts = loadServerAccounts();
-    const registrations = loadTeacherRegistrations();
-    const classes = loadServerClasses();
+    const hydrated = await hydrateServerStateFromFirestore(true);
+    const accounts = hydrated.accounts;
+    const registrations = hydrated.registrations;
+    const classes = hydrated.classes;
 
     const desiredUsername = username
       ? String(username).trim().toUpperCase()
       : `GV-${normalizedPhone.slice(-6)}`;
 
-    // Check if an existing registration for this phone or gmail is still pending verification
+    // Check if an existing registration for this phone or gmail exists
     const existingReg = registrations.find(
       (r) =>
         r.gmail.toLowerCase() === normalizedGmail ||
@@ -2190,25 +3130,77 @@ export function createApiApp(): express.Express {
         });
         return;
       }
-      // Update pending registration details if not approved yet
+
+      const resolvedUid = await resolveOrCreateTeacherFirebaseUid({
+        gmail: normalizedGmail,
+        phone: normalizedPhone,
+        fullName: String(fullName).trim(),
+        password: String(password),
+        existingUid: existingReg.teacherUid
+      });
+      if (resolvedUid && resolvedUid !== existingReg.teacherUid) {
+        await migrateTeacherUidAcrossCollections(
+          existingReg.teacherUid,
+          resolvedUid,
+          registrations,
+          accounts,
+          classes
+        );
+      }
+
       existingReg.fullName = String(fullName).trim();
       existingReg.phone = normalizedPhone;
       existingReg.gmail = normalizedGmail;
       existingReg.verificationMethod = method;
       existingReg.updatedAt = new Date().toISOString();
 
-      const linkedAcc = accounts.find((a) => a.id === existingReg.teacherUid);
+      let linkedAcc = accounts.find((a) => a.id === existingReg.teacherUid);
+      const salt = generateSaltServer();
+      const passwordHash = hashPasswordServer(String(password), salt);
       if (linkedAcc) {
-        const salt = generateSaltServer();
         linkedAcc.fullName = existingReg.fullName;
         linkedAcc.phone = normalizedPhone;
         linkedAcc.email = normalizedGmail;
         linkedAcc.verificationMethod = method;
         linkedAcc.passwordSalt = salt;
-        linkedAcc.passwordHash = hashPasswordServer(String(password), salt);
-        saveServerAccounts(accounts);
+        linkedAcc.passwordHash = passwordHash;
+      } else {
+        linkedAcc = {
+          id: existingReg.teacherUid,
+          username: existingReg.username,
+          fullName: existingReg.fullName,
+          role: 'teacher',
+          email: normalizedGmail,
+          phone: normalizedPhone,
+          verificationMethod: method,
+          phoneVerified: Boolean(existingReg.phoneVerified),
+          gmailVerified: Boolean(existingReg.gmailVerified),
+          teacherApprovalStatus: existingReg.approvalStatus,
+          isActivated: true,
+          passwordSalt: salt,
+          passwordHash,
+          createdAt: existingReg.createdAt,
+          status: 'pending_activation',
+          notes: 'Đăng ký Giáo viên — Chờ xác minh OTP và Quản trị viên duyệt'
+        };
+        accounts.push(linkedAcc);
       }
-      saveTeacherRegistrations(registrations);
+
+      normalizeUnifiedTeacherPair(existingReg, linkedAcc);
+
+      const persisted = await persistTeacherRegistrationAndAccount(
+        existingReg,
+        linkedAcc,
+        registrations,
+        accounts
+      );
+      if (!persisted.saved) {
+        res.status(500).json({
+          success: false,
+          message: persisted.error || 'Không thể lưu hồ sơ đăng ký Giáo viên. Vui lòng thử lại.'
+        });
+        return;
+      }
 
       res.json({
         success: true,
@@ -2231,8 +3223,13 @@ export function createApiApp(): express.Express {
     }
 
     const salt = generateSaltServer();
-    const teacherUid = `teacher-${crypto.randomUUID()}`;
-    const registrationId = `treg-${crypto.randomUUID()}`;
+    const teacherUid = await resolveOrCreateTeacherFirebaseUid({
+      gmail: normalizedGmail,
+      phone: normalizedPhone,
+      fullName: String(fullName).trim(),
+      password: String(password)
+    });
+    const registrationId = `treg-${teacherUid}`;
     const now = new Date().toISOString();
 
     const newTeacherAccount: StoredUserAccount = {
@@ -2272,8 +3269,20 @@ export function createApiApp(): express.Express {
 
     accounts.push(newTeacherAccount);
     registrations.unshift(newRegistration);
-    saveServerAccounts(accounts);
-    saveTeacherRegistrations(registrations);
+
+    const persisted = await persistTeacherRegistrationAndAccount(
+      newRegistration,
+      newTeacherAccount,
+      registrations,
+      accounts
+    );
+    if (!persisted.saved) {
+      res.status(500).json({
+        success: false,
+        message: persisted.error || 'Không thể lưu hồ sơ đăng ký Giáo viên. Vui lòng thử lại.'
+      });
+      return;
+    }
 
     res.json({
       success: true,
@@ -2318,8 +3327,9 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    const registrations = loadTeacherRegistrations();
-    const accounts = loadServerAccounts();
+    const hydrated = await hydrateServerStateFromFirestore(false);
+    const registrations = hydrated.registrations;
+    const accounts = hydrated.accounts;
     const reg = hydrateTeacherRegistrationFromStateToken(
       String(registrationId),
       registrationStateToken,
@@ -2378,9 +3388,21 @@ export function createApiApp(): express.Express {
     reg.gmailOtpAttempts = 0;
     reg.lastOtpSentAt = new Date().toISOString();
     reg.updatedAt = new Date().toISOString();
-    saveTeacherRegistrations(registrations);
 
     const linkedAcc = accounts.find((a) => a.id === reg.teacherUid);
+    const persisted = await persistTeacherRegistrationAndAccount(
+      reg,
+      linkedAcc,
+      registrations,
+      accounts
+    );
+    if (!persisted.saved) {
+      res.status(500).json({
+        success: false,
+        message: persisted.error || 'Đã gửi mã OTP nhưng không thể lưu trạng thái xác minh trên máy chủ.'
+      });
+      return;
+    }
 
     res.json({
       success: true,
@@ -2393,7 +3415,7 @@ export function createApiApp(): express.Express {
   });
 
   // Verify Gmail OTP against server-side salted PBKDF2 hash
-  app.post('/api/teacher-registration/verify-gmail-otp', (req, res) => {
+  app.post('/api/teacher-registration/verify-gmail-otp', async (req, res) => {
     const { registrationId, otpCode, registrationStateToken } = req.body || {};
     if (!registrationId || !otpCode) {
       res.status(400).json({
@@ -2403,9 +3425,10 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    const registrations = loadTeacherRegistrations();
-    const accounts = loadServerAccounts();
-    const classes = loadServerClasses();
+    const hydrated = await hydrateServerStateFromFirestore(true);
+    const registrations = hydrated.registrations;
+    const accounts = hydrated.accounts;
+    const classes = hydrated.classes;
     const reg = hydrateTeacherRegistrationFromStateToken(
       String(registrationId),
       registrationStateToken,
@@ -2449,8 +3472,8 @@ export function createApiApp(): express.Express {
       crypto.timingSafeEqual(Buffer.from(candidateHash), Buffer.from(reg.gmailOtpHash));
 
     if (!isMatch) {
-      saveTeacherRegistrations(registrations);
       const linkedAcc = accounts.find((a) => a.id === reg.teacherUid);
+      await persistTeacherRegistrationAndAccount(reg, linkedAcc, registrations, accounts);
       res.status(401).json({
         success: false,
         remainingAttempts: Math.max(0, 5 - reg.gmailOtpAttempts),
@@ -2458,6 +3481,23 @@ export function createApiApp(): express.Express {
         message: `Mã xác minh Gmail không chính xác. Còn ${Math.max(0, 5 - reg.gmailOtpAttempts)} lần thử.`
       });
       return;
+    }
+
+    // Ensure teacher profile is bound to a canonical Firebase UID
+    const resolvedFirebaseUid = await resolveOrCreateTeacherFirebaseUid({
+      gmail: reg.gmail,
+      phone: reg.phone,
+      fullName: reg.fullName,
+      existingUid: reg.teacherUid
+    });
+    if (resolvedFirebaseUid && resolvedFirebaseUid !== reg.teacherUid) {
+      await migrateTeacherUidAcrossCollections(
+        reg.teacherUid,
+        resolvedFirebaseUid,
+        registrations,
+        accounts,
+        classes
+      );
     }
 
     const now = new Date().toISOString();
@@ -2481,9 +3521,24 @@ export function createApiApp(): express.Express {
       if (teacherAcc.teacherApprovalStatus === 'pending_verification') {
         teacherAcc.teacherApprovalStatus = 'pending_admin_approval';
       }
-      saveServerAccounts(accounts);
+      normalizeUnifiedTeacherPair(reg, teacherAcc);
     }
-    saveTeacherRegistrations(registrations);
+
+    const persisted = await persistTeacherRegistrationAndAccount(
+      reg,
+      teacherAcc,
+      registrations,
+      accounts
+    );
+    if (!persisted.saved) {
+      res.status(500).json({
+        success: false,
+        message:
+          persisted.error ||
+          'Xác minh OTP hợp lệ nhưng không thể lưu trạng thái hồ sơ vào hệ thống. Vui lòng thử lại.'
+      });
+      return;
+    }
 
     res.json({
       success: true,
@@ -2505,9 +3560,10 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    const registrations = loadTeacherRegistrations();
-    const accounts = loadServerAccounts();
-    const classes = loadServerClasses();
+    const hydrated = await hydrateServerStateFromFirestore(true);
+    const registrations = hydrated.registrations;
+    const accounts = hydrated.accounts;
+    const classes = hydrated.classes;
     const reg = hydrateTeacherRegistrationFromStateToken(
       String(registrationId),
       registrationStateToken,
@@ -2534,6 +3590,18 @@ export function createApiApp(): express.Express {
       return;
     }
 
+    // Bind the teacher registration & account directly to the verified Firebase UID
+    const verifiedPhoneFirebaseUid = String(verification.firebaseUid || '').trim();
+    if (verifiedPhoneFirebaseUid && verifiedPhoneFirebaseUid !== reg.teacherUid) {
+      await migrateTeacherUidAcrossCollections(
+        reg.teacherUid,
+        verifiedPhoneFirebaseUid,
+        registrations,
+        accounts,
+        classes
+      );
+    }
+
     const now = new Date().toISOString();
     reg.phoneVerified = true;
     reg.phoneVerifiedAt = now;
@@ -2551,9 +3619,24 @@ export function createApiApp(): express.Express {
       if (teacherAcc.teacherApprovalStatus === 'pending_verification') {
         teacherAcc.teacherApprovalStatus = 'pending_admin_approval';
       }
-      saveServerAccounts(accounts);
+      normalizeUnifiedTeacherPair(reg, teacherAcc);
     }
-    saveTeacherRegistrations(registrations);
+
+    const persisted = await persistTeacherRegistrationAndAccount(
+      reg,
+      teacherAcc,
+      registrations,
+      accounts
+    );
+    if (!persisted.saved) {
+      res.status(500).json({
+        success: false,
+        message:
+          persisted.error ||
+          'Xác minh OTP Số điện thoại hợp lệ nhưng không thể lưu hồ sơ Giáo viên vào hệ thống. Vui lòng thử lại.'
+      });
+      return;
+    }
 
     res.json({
       success: true,
@@ -2564,11 +3647,22 @@ export function createApiApp(): express.Express {
     });
   });
 
-  app.get('/api/teacher-registration/status/:identifier', (req, res) => {
+  app.get('/api/teacher-registration/status/:identifier', async (req, res) => {
     const identifier = String(req.params.identifier || '').trim().toLowerCase();
-    const registrations = loadTeacherRegistrations();
-    const classes = loadServerClasses();
-    const accounts = loadServerAccounts();
+    const stateTokenFromQuery = req.query?.stateToken ? String(req.query.stateToken) : undefined;
+    const hydrated = await hydrateServerStateFromFirestore(true);
+    const registrations = hydrated.registrations;
+    const classes = hydrated.classes;
+    const accounts = hydrated.accounts;
+
+    if (stateTokenFromQuery) {
+      hydrateTeacherRegistrationFromStateToken(
+        identifier,
+        stateTokenFromQuery,
+        registrations,
+        accounts
+      );
+    }
 
     const reg = registrations.find(
       (r) =>
@@ -2585,6 +3679,9 @@ export function createApiApp(): express.Express {
     }
 
     const linkedAcc = accounts.find((a) => a.id === reg.teacherUid);
+    if (linkedAcc) {
+      normalizeUnifiedTeacherPair(reg, linkedAcc);
+    }
     res.json({
       found: true,
       registration: sanitizeRegistrationForClient(reg, classes, accounts),
@@ -2596,19 +3693,29 @@ export function createApiApp(): express.Express {
   // ==========================================================================
   // 1C. ADMINISTRATOR PORTAL ENDPOINTS (PROTECTED BY requireAdminAuth)
   // ==========================================================================
-  app.get('/api/admin/overview', requireAdminAuth, (_req, res) => {
-    const registrations = loadTeacherRegistrations();
-    const accounts = loadServerAccounts();
-    const classes = loadServerClasses();
+  app.get('/api/admin/overview', requireAdminAuth, async (_req, res) => {
+    const hydrated = await hydrateServerStateFromFirestore(true);
+    const registrations = hydrated.registrations;
+    const accounts = hydrated.accounts;
+    const classes = hydrated.classes;
     const auditLogs = loadAdminAuditLogs();
 
     // Ensure any teacher in accounts has a registration entry for complete visibility
     const regMap = new Map<string, StoredTeacherRegistration>();
     for (const r of registrations) {
+      const linkedAcc = accounts.find((a) => a.id === r.teacherUid && a.role === 'teacher');
+      if (linkedAcc) {
+        normalizeUnifiedTeacherPair(r, linkedAcc);
+      }
       regMap.set(r.teacherUid, r);
     }
     for (const acc of accounts) {
       if (acc.role === 'teacher' && !regMap.has(acc.id)) {
+        const isOwned = Boolean(acc.phoneVerified || acc.gmailVerified);
+        let unifiedStatus: TeacherApprovalStatus = acc.teacherApprovalStatus || 'pending_verification';
+        if (isOwned && unifiedStatus === 'pending_verification') {
+          unifiedStatus = 'pending_admin_approval';
+        }
         regMap.set(acc.id, {
           id: `treg-${acc.id}`,
           teacherUid: acc.id,
@@ -2619,8 +3726,8 @@ export function createApiApp(): express.Express {
           verificationMethod: acc.verificationMethod || 'phone_otp',
           phoneVerified: Boolean(acc.phoneVerified),
           gmailVerified: Boolean(acc.gmailVerified),
-          isOwnershipVerified: Boolean(acc.phoneVerified || acc.gmailVerified),
-          approvalStatus: acc.teacherApprovalStatus || 'pending_verification',
+          isOwnershipVerified: isOwned,
+          approvalStatus: unifiedStatus,
           rejectionReason: acc.rejectionReason,
           reviewedByUid: acc.reviewedByUid,
           reviewedByName: acc.reviewedByName,
@@ -2631,9 +3738,19 @@ export function createApiApp(): express.Express {
       }
     }
 
-    const enrichedRegistrations = Array.from(regMap.values()).map((r) =>
-      sanitizeRegistrationForClient(r, classes, accounts)
-    );
+    const enrichedRegistrations = Array.from(regMap.values())
+      .map((r) => sanitizeRegistrationForClient(r, classes, accounts))
+      .sort((a, b) => {
+        if (a.approvalStatus === 'pending_admin_approval' && b.approvalStatus !== 'pending_admin_approval') {
+          return -1;
+        }
+        if (b.approvalStatus === 'pending_admin_approval' && a.approvalStatus !== 'pending_admin_approval') {
+          return 1;
+        }
+        return String(b.updatedAt || b.createdAt || '').localeCompare(
+          String(a.updatedAt || a.createdAt || '')
+        );
+      });
     const enrichedClasses = classes.map((c) => enrichClassroomForClient(c, accounts));
 
     res.json({
@@ -2662,7 +3779,7 @@ export function createApiApp(): express.Express {
     });
   });
 
-  app.post('/api/admin/teacher-review', requireAdminAuth, (req, res) => {
+  app.post('/api/admin/teacher-review', requireAdminAuth, async (req, res) => {
     const adminUser = (req as any).authUser as StoredUserAccount;
     const { teacherUid, registrationId, action, reason } = req.body || {};
 
@@ -2674,9 +3791,10 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    const registrations = loadTeacherRegistrations();
-    const accounts = loadServerAccounts();
-    const classes = loadServerClasses();
+    const hydrated = await hydrateServerStateFromFirestore(true);
+    const registrations = hydrated.registrations;
+    const accounts = hydrated.accounts;
+    const classes = hydrated.classes;
     const auditLogs = loadAdminAuditLogs();
 
     const reg = registrations.find(
@@ -2693,13 +3811,28 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    const teacherAcc = accounts.find((a) => a.id === reg.teacherUid && a.role === 'teacher');
+    let teacherAcc = accounts.find((a) => a.id === reg.teacherUid && a.role === 'teacher');
     if (!teacherAcc) {
-      res.status(404).json({
-        success: false,
-        message: 'Không tìm thấy tài khoản giáo viên liên kết.'
-      });
-      return;
+      const salt = generateSaltServer();
+      teacherAcc = {
+        id: reg.teacherUid,
+        username: reg.username,
+        fullName: reg.fullName,
+        role: 'teacher',
+        email: reg.gmail,
+        phone: reg.phone,
+        verificationMethod: reg.verificationMethod || 'phone_otp',
+        phoneVerified: Boolean(reg.phoneVerified),
+        gmailVerified: Boolean(reg.gmailVerified),
+        teacherApprovalStatus: reg.approvalStatus || 'pending_verification',
+        isActivated: true,
+        passwordSalt: salt,
+        passwordHash: hashPasswordServer(crypto.randomBytes(16).toString('hex'), salt),
+        createdAt: reg.createdAt || new Date().toISOString(),
+        status: 'pending_activation',
+        notes: 'Khôi phục tài khoản giáo viên từ hồ sơ đăng ký'
+      };
+      accounts.push(teacherAcc);
     }
 
     const now = new Date().toISOString();
@@ -2788,13 +3921,27 @@ export function createApiApp(): express.Express {
       performedAt: now
     };
 
+    const persisted = await persistTeacherRegistrationAndAccount(
+      reg,
+      teacherAcc,
+      registrations,
+      accounts
+    );
+    if (!persisted.saved) {
+      res.status(500).json({
+        success: false,
+        message:
+          persisted.error ||
+          'Không thể lưu trạng thái phê duyệt giáo viên vào cơ sở dữ liệu. Vui lòng thử lại.'
+      });
+      return;
+    }
+
     auditLogs.unshift(auditEntry);
-    saveTeacherRegistrations(registrations);
-    saveServerAccounts(accounts);
     saveAdminAuditLogs(auditLogs);
 
     // Đồng bộ quyền Giáo viên vào Cloud Firestore (/admins/{teacherUid}) qua Firebase Admin SDK (nếu đã cấu hình)
-    syncTeacherRoleInFirestoreAdminSdk({
+    await syncTeacherRoleInFirestoreAdminSdk({
       teacherUid: reg.teacherUid,
       approved: action === 'approve' || action === 'reactivate',
       reviewedByUid: adminUser.id
@@ -2838,9 +3985,7 @@ export function createApiApp(): express.Express {
   });
 
   app.get('/api/auth/me', requireAuth, (req, res) => {
-    const session = (req as any).authSession as SessionTokenPayload;
-    const accounts = loadServerAccounts();
-    const user = accounts.find((a) => a.id === session.uid);
+    const user = (req as any).authUser as StoredUserAccount;
     if (!user || user.status === 'locked') {
       res.status(401).json({ authenticated: false });
       return;
@@ -2862,7 +4007,7 @@ export function createApiApp(): express.Express {
     });
   });
 
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body || {};
     if (!username || !password) {
       res.status(400).json({
@@ -2872,15 +4017,21 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    const accounts = loadServerAccounts();
+    const hydrated = await hydrateServerStateFromFirestore(true);
+    const accounts = hydrated.accounts;
+    const registrations = hydrated.registrations;
     const trimmedInput = String(username).trim();
     const normalizedUsername = trimmedInput.toUpperCase();
     const normalizedEmail = trimmedInput.toLowerCase();
+    const normalizedPhone = isValidPhoneFormat(trimmedInput)
+      ? normalizePhoneE164(trimmedInput)
+      : '';
 
     const user = accounts.find(
       (a) =>
         a.username.toUpperCase() === normalizedUsername ||
-        (a.email && a.email.toLowerCase() === normalizedEmail)
+        (a.email && a.email.toLowerCase() === normalizedEmail) ||
+        (normalizedPhone && a.phone && normalizePhoneE164(a.phone) === normalizedPhone)
     );
 
     if (!user) {
@@ -2922,8 +4073,14 @@ export function createApiApp(): express.Express {
 
     // Teacher approval & verification gate: unapproved teachers cannot log into Teacher Portal
     if (user.role === 'teacher') {
-      const registrations = loadTeacherRegistrations();
-      const reg = registrations.find((r) => r.teacherUid === user.id);
+      const reg = registrations.find(
+        (r) =>
+          r.teacherUid === user.id ||
+          (user.email && r.gmail && r.gmail.toLowerCase() === user.email.toLowerCase())
+      );
+      if (reg) {
+        normalizeUnifiedTeacherPair(reg, user);
+      }
 
       if (user.teacherApprovalStatus === 'pending_verification') {
         res.status(403).json({
@@ -2987,7 +4144,16 @@ export function createApiApp(): express.Express {
     }
 
     user.lastLoginAt = new Date().toISOString();
-    saveServerAccounts(accounts);
+    if (user.role === 'teacher') {
+      const reg = registrations.find((r) => r.teacherUid === user.id);
+      if (reg) {
+        await persistTeacherRegistrationAndAccount(reg, user, registrations, accounts);
+      } else {
+        saveServerAccounts(accounts);
+      }
+    } else {
+      saveServerAccounts(accounts);
+    }
 
     const sessionToken = signSessionToken({
       uid: user.id,
@@ -3006,7 +4172,7 @@ export function createApiApp(): express.Express {
     });
   });
 
-  app.post('/api/auth/activate', (req, res) => {
+  app.post('/api/auth/activate', async (req, res) => {
     const { username, activationCode, newPassword } = req.body || {};
     if (!username || !activationCode || !newPassword) {
       res.status(400).json({
@@ -3024,7 +4190,9 @@ export function createApiApp(): express.Express {
       return;
     }
 
-    const accounts = loadServerAccounts();
+    const hydrated = await hydrateServerStateFromFirestore(false);
+    const accounts = hydrated.accounts;
+    const classes = hydrated.classes;
     const normalizedUsername = String(username).trim().toUpperCase();
     const trimmedCode = String(activationCode).trim();
     const user = accounts.find(
@@ -3075,7 +4243,7 @@ export function createApiApp(): express.Express {
     user.status = 'active';
     user.lastLoginAt = new Date().toISOString();
 
-    saveServerAccounts(accounts);
+    await persistStudentAccountToStores(user, accounts, undefined, classes);
 
     const sessionToken = signSessionToken({
       uid: user.id,
@@ -3159,7 +4327,10 @@ export function createApiApp(): express.Express {
 
     const configuredFirstAdminUid = getConfiguredFirstAdminUid();
     const adminStatus = getFirebaseAdminStatus();
-    const accounts = loadServerAccounts();
+    const hydrated = await hydrateServerStateFromFirestore(true);
+    const accounts = hydrated.accounts;
+    const registrations = hydrated.registrations;
+    const classes = hydrated.classes;
 
     // Nếu UID đã xác thực trên máy chủ trùng khớp với process.env.FIRST_ADMIN_UID:
     // Tự động đồng bộ custom claim admin=true và hồ sơ /admins/{uid} qua Firebase Admin SDK nếu đã cấu hình Service Account
@@ -3250,10 +4421,11 @@ export function createApiApp(): express.Express {
     }
 
     // 2. Đối chiếu tài khoản Giáo viên hoặc Học sinh (Không bao giờ cho phép khớp vào vai trò 'admin' nếu không có claim)
-    const user = accounts.find(
+    let user = accounts.find(
       (a) =>
         a.role !== 'admin' &&
         (a.id === verifiedUid ||
+          (a as any).firebasePhoneUid === verifiedUid ||
           (verifiedEmail && a.email && a.email.toLowerCase() === verifiedEmail))
     );
 
@@ -3279,6 +4451,28 @@ export function createApiApp(): express.Express {
         message: `Từ chối quyền truy cập (403): Tài khoản Firebase (${verifiedEmail || verifiedUid}, UID: ${verifiedUid}) không khớp với FIRST_ADMIN_UID đã cấu hình trên máy chủ và chưa có hồ sơ Giáo viên/Học sinh được duyệt.`
       });
       return;
+    }
+
+    // Nếu giáo viên khớp qua email nhưng UID trong hồ sơ cũ chưa trùng verifiedUid, đồng bộ sang UID Firebase thật
+    let reg = registrations.find(
+      (r) =>
+        r.teacherUid === user!.id ||
+        (verifiedEmail && r.gmail && r.gmail.toLowerCase() === verifiedEmail)
+    );
+    if (user.role === 'teacher' && verifiedUid && user.id !== verifiedUid) {
+      await migrateTeacherUidAcrossCollections(
+        user.id,
+        verifiedUid,
+        registrations,
+        accounts,
+        classes
+      );
+      user = accounts.find((a) => a.id === verifiedUid) || user;
+      reg = registrations.find((r) => r.teacherUid === verifiedUid) || reg;
+    }
+
+    if (user.role === 'teacher' && reg) {
+      normalizeUnifiedTeacherPair(reg, user);
     }
 
     if (user.role === 'teacher' && user.teacherApprovalStatus !== 'approved') {
@@ -3307,7 +4501,11 @@ export function createApiApp(): express.Express {
     user.isActivated = true;
     user.status = 'active';
     user.lastLoginAt = new Date().toISOString();
-    saveServerAccounts(accounts);
+    if (user.role === 'teacher' && reg) {
+      await persistTeacherRegistrationAndAccount(reg, user, registrations, accounts);
+    } else {
+      saveServerAccounts(accounts);
+    }
 
     const sessionToken = signSessionToken({
       uid: user.id,
@@ -3369,10 +4567,11 @@ export function createApiApp(): express.Express {
   // ==========================================================================
   // 2B. TEACHER CLASS & STUDENT QUOTA MANAGEMENT (5 CLASSES x 50 STUDENTS)
   // ==========================================================================
-  app.get('/api/classes', requireTeacherAuth, (req, res) => {
+  app.get('/api/classes', requireTeacherAuth, async (req, res) => {
     const session = (req as any).authSession as SessionTokenPayload;
-    const classes = loadServerClasses();
-    const accounts = loadServerAccounts();
+    const hydrated = await hydrateServerStateFromFirestore(false);
+    const classes = hydrated.classes;
+    const accounts = hydrated.accounts;
 
     const scopedClasses =
       session.role === 'admin'
@@ -3394,10 +4593,11 @@ export function createApiApp(): express.Express {
   });
 
   // Student endpoint to view their own enrolled class info
-  app.get('/api/my-class', requireAuth, (req, res) => {
+  app.get('/api/my-class', requireAuth, async (req, res) => {
     const authUser = (req as any).authUser as StoredUserAccount;
-    const classes = loadServerClasses();
-    const accounts = loadServerAccounts();
+    const hydrated = await hydrateServerStateFromFirestore(false);
+    const classes = hydrated.classes;
+    const accounts = hydrated.accounts;
 
     if (authUser.role === 'student') {
       const myClass = classes.find(
@@ -3423,7 +4623,7 @@ export function createApiApp(): express.Express {
     const session = (req as any).authSession as SessionTokenPayload;
     const authUser = (req as any).authUser as StoredUserAccount;
 
-    if (session.role !== 'teacher') {
+    if (session.role !== 'teacher' && session.role !== 'admin') {
       res.status(403).json({
         error: 'Chỉ tài khoản Giáo viên đã được Quản trị viên phê duyệt mới có thể tạo lớp học phụ trách.'
       });
@@ -3439,11 +4639,13 @@ export function createApiApp(): express.Express {
     const normalizedName = rawName.toUpperCase();
 
     await withQuotaLock(async () => {
-      const classes = loadServerClasses();
-      const accounts = loadServerAccounts();
+      const hydrated = await hydrateServerStateFromFirestore(true);
+      const classes = hydrated.classes;
+      const accounts = hydrated.accounts;
+      const effectiveTeacherUid = authUser.id;
 
       const teacherActiveClasses = classes.filter(
-        (c) => c.teacherUid === session.uid && c.status === 'active'
+        (c) => c.teacherUid === effectiveTeacherUid && c.status === 'active'
       );
 
       if (
@@ -3474,7 +4676,7 @@ export function createApiApp(): express.Express {
       const newClass: StoredClassroomRecord = {
         id: `cls-${crypto.randomUUID()}`,
         name: normalizedName,
-        teacherUid: session.uid,
+        teacherUid: effectiveTeacherUid,
         teacherName: authUser.fullName,
         status: 'active',
         enrolledCount: 0,
@@ -3484,7 +4686,13 @@ export function createApiApp(): express.Express {
       };
 
       classes.push(newClass);
-      saveServerClasses(classes);
+      const persisted = await persistClassroomToStores(newClass, classes);
+      if (!persisted.saved) {
+        res.status(500).json({
+          error: persisted.error || 'Không thể lưu lớp học mới vào cơ sở dữ liệu. Vui lòng thử lại.'
+        });
+        return;
+      }
 
       const newActiveCount = teacherActiveClasses.length + 1;
       res.json({
@@ -3515,8 +4723,10 @@ export function createApiApp(): express.Express {
     }
 
     await withQuotaLock(async () => {
-      const accounts = loadServerAccounts();
-      const classes = loadServerClasses();
+      const hydrated = await hydrateServerStateFromFirestore(true);
+      const accounts = hydrated.accounts;
+      const classes = hydrated.classes;
+      const effectiveTeacherUid = authUser.id;
 
       const normalizedUsername = String(username).trim().toUpperCase();
       const normalizedFullName = String(fullName).trim();
@@ -3527,11 +4737,11 @@ export function createApiApp(): express.Express {
       let targetClass = classes.find(
         (c) =>
           (classId && c.id === classId) ||
-          (c.teacherUid === session.uid && c.name.toUpperCase() === targetClassName)
+          (c.teacherUid === effectiveTeacherUid && c.name.toUpperCase() === targetClassName)
       );
 
       // If classId was specified and belongs to another teacher -> 403 Forbidden
-      if (targetClass && targetClass.teacherUid !== session.uid && session.role !== 'admin') {
+      if (targetClass && targetClass.teacherUid !== effectiveTeacherUid && session.role !== 'admin') {
         res.status(403).json({
           error:
             'Từ chối truy cập (403): Bạn chỉ được phép quản lí và ghi danh học sinh vào lớp thuộc phạm vi phụ trách của mình.'
@@ -3548,7 +4758,7 @@ export function createApiApp(): express.Express {
       // If teacher does not have this class yet, auto-create ONLY if within 5-class quota
       if (!targetClass) {
         const teacherActiveClasses = classes.filter(
-          (c) => c.teacherUid === session.uid && c.status === 'active'
+          (c) => c.teacherUid === effectiveTeacherUid && c.status === 'active'
         );
         if (teacherActiveClasses.length >= MAX_ACTIVE_CLASSES_PER_TEACHER) {
           res.status(403).json({
@@ -3561,7 +4771,7 @@ export function createApiApp(): express.Express {
         targetClass = {
           id: `cls-${crypto.randomUUID()}`,
           name: targetClassName,
-          teacherUid: session.uid,
+          teacherUid: effectiveTeacherUid,
           teacherName: authUser.fullName,
           status: 'active',
           enrolledCount: 0,
@@ -3639,8 +4849,18 @@ export function createApiApp(): express.Express {
       targetClass.enrolledCount = enrolledInClass.length + 1;
       targetClass.updatedAt = new Date().toISOString();
 
-      saveServerAccounts(accounts);
-      saveServerClasses(classes);
+      const persisted = await persistStudentAccountToStores(
+        newAccount,
+        accounts,
+        targetClass,
+        classes
+      );
+      if (!persisted.saved) {
+        res.status(500).json({
+          error: persisted.error || 'Không thể lưu tài khoản học sinh vào cơ sở dữ liệu.'
+        });
+        return;
+      }
 
       res.json({
         account: sanitizeAccountForClient(newAccount, true),

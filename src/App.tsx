@@ -46,6 +46,7 @@ import {
   saveAuthSession,
   isVerifiedTeacherSession,
   isVerifiedAdminSession,
+  verifyActiveSessionWithServer,
   matchAccountByGoogleEmail,
   fetchStudentStateFromServer,
   saveStudentStateToServer,
@@ -151,18 +152,32 @@ export default function App() {
     return out;
   };
 
-  // Khôi phục phiên đăng nhập hợp lệ từ sessionStorage (nếu có Bearer token hợp lệ)
+  // Khôi phục và xác minh lại phiên đăng nhập hợp lệ từ sessionStorage với máy chủ (/api/auth/me)
   useEffect(() => {
     const savedUser = getSavedSessionUser();
     if (savedUser) {
       setCurrentUser(savedUser);
       setUserRole(savedUser.role);
-      if (savedUser.role === 'teacher' && isVerifiedTeacherSession()) {
-        initializeAccounts().then(setAccounts);
-        fetchAllStudentStatesForTeacher().then((m) =>
-          setStudentStatesMap(normalizeStudentStatesMap(m))
-        );
-      }
+      verifyActiveSessionWithServer().then((verified) => {
+        if (!verified.valid || !verified.user) {
+          setCurrentUser(null);
+          setUserRole('student');
+          setCurrentTab('home');
+          return;
+        }
+        setCurrentUser(verified.user);
+        setUserRole(verified.user.role);
+        if (
+          (verified.user.role === 'teacher' &&
+            verified.user.teacherApprovalStatus === 'approved') ||
+          verified.user.role === 'admin'
+        ) {
+          initializeAccounts().then(setAccounts);
+          fetchAllStudentStatesForTeacher().then((m) =>
+            setStudentStatesMap(normalizeStudentStatesMap(m))
+          );
+        }
+      });
     }
   }, []);
 
@@ -646,8 +661,9 @@ export default function App() {
 
   const isTeacherVerified = Boolean(
     currentUser &&
-      (currentUser.role === 'teacher' || currentUser.role === 'admin') &&
       currentUser.status === 'active' &&
+      (currentUser.role === 'admin' ||
+        (currentUser.role === 'teacher' && currentUser.teacherApprovalStatus === 'approved')) &&
       isVerifiedTeacherSession()
   );
 

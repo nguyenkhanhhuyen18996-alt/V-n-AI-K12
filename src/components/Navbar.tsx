@@ -53,8 +53,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   // Chỉ tài khoản đã đăng nhập và được quản trị viên duyệt mới mở được khu vực giáo viên
   const isVerifiedTeacher = Boolean(
     currentUser &&
-      (currentUser.role === 'teacher' || currentUser.role === 'admin') &&
-      currentUser.status === 'active'
+      currentUser.status === 'active' &&
+      (currentUser.role === 'admin' ||
+        (currentUser.role === 'teacher' && currentUser.teacherApprovalStatus === 'approved'))
   );
   const isVerifiedAdmin = Boolean(
     currentUser && currentUser.role === 'admin' && currentUser.status === 'active'
