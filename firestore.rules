@@ -86,11 +86,20 @@ service cloud.firestore {
           'enrolledCount', 'maxCapacity', 'createdAt', 'updatedAt'
         ]) &&
         data.keys().hasOnly([
-          'id', 'name', 'teacherUid', 'teacherName', 'status',
+          'id', 'name', 'grade', 'schoolYear', 'description',
+          'joinCode', 'allowJoinByCode', 'pendingJoinCount', 'remainingSeats',
+          'teacherUid', 'teacherName', 'status',
           'enrolledCount', 'maxCapacity', 'createdAt', 'updatedAt'
         ]) &&
         data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.name is string && data.name.size() >= 1 && data.name.size() <= 64 &&
+        (!('grade' in data) || (data.grade is string && data.grade.size() <= 16)) &&
+        (!('schoolYear' in data) || (data.schoolYear is string && data.schoolYear.size() <= 32)) &&
+        (!('description' in data) || (data.description is string && data.description.size() <= 500)) &&
+        (!('joinCode' in data) || (data.joinCode is string && data.joinCode.size() <= 32)) &&
+        (!('allowJoinByCode' in data) || data.allowJoinByCode is bool) &&
+        (!('pendingJoinCount' in data) || (data.pendingJoinCount is int && data.pendingJoinCount >= 0)) &&
+        (!('remainingSeats' in data) || (data.remainingSeats is int && data.remainingSeats >= 0 && data.remainingSeats <= 50)) &&
         data.teacherUid is string && data.teacherUid.size() >= 1 && data.teacherUid.size() <= 128 && data.teacherUid.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.teacherName is string && data.teacherName.size() >= 1 && data.teacherName.size() <= 120 &&
         data.status is string && data.status in ['active', 'archived'] &&
@@ -98,6 +107,20 @@ service cloud.firestore {
         data.maxCapacity is int && data.maxCapacity == 50 &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
+    }
+
+    function isValidClassJoinRequestDocument(data) {
+      return data.keys().hasAll([
+          'id', 'classId', 'className', 'teacherUid', 'teacherName',
+          'fullName', 'status', 'createdAt'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+        data.classId is string && data.classId.size() >= 1 && data.classId.size() <= 128 &&
+        data.className is string && data.className.size() >= 1 && data.className.size() <= 64 &&
+        data.teacherUid is string && data.teacherUid.size() >= 1 && data.teacherUid.size() <= 128 &&
+        data.teacherName is string && data.teacherName.size() >= 1 && data.teacherName.size() <= 120 &&
+        data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 120 &&
+        data.status is string && data.status in ['pending', 'approved', 'rejected'];
     }
 
     function isValidTeacherRegistrationDocument(data) {
@@ -566,6 +589,20 @@ service cloud.firestore {
         incoming().updatedAt == request.time;
 
       allow delete: if isSuperAdmin() && isValidId(registrationId);
+    }
+
+    // =========================================================================
+    // COLLECTION 8: /class_join_requests/{requestId}
+    // =========================================================================
+    match /class_join_requests/{requestId} {
+      allow get, list: if isSignedIn() && (
+        resource.data.teacherUid == request.auth.uid || isSuperAdmin()
+      );
+      allow create, update: if isAdmin() &&
+        isValidId(requestId) &&
+        isValidClassJoinRequestDocument(incoming()) &&
+        (request.auth.uid == incoming().teacherUid || isSuperAdmin());
+      allow delete: if isSuperAdmin() && isValidId(requestId);
     }
   }
 }

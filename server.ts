@@ -18,6 +18,7 @@ const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts_v2.json');
 const STUDENT_STATES_FILE = path.join(DATA_DIR, 'student_states_v2.json');
 const TEACHER_REGISTRATIONS_FILE = path.join(DATA_DIR, 'teacher_registrations_v2.json');
 const CLASSES_FILE = path.join(DATA_DIR, 'classes_v2.json');
+const CLASS_JOIN_REQUESTS_FILE = path.join(DATA_DIR, 'class_join_requests_v2.json');
 const ADMIN_AUDIT_LOGS_FILE = path.join(DATA_DIR, 'admin_audit_logs_v2.json');
 
 const MAX_ACTIVE_CLASSES_PER_TEACHER = 5;
@@ -948,6 +949,11 @@ export interface StoredTeacherRegistration {
 export interface StoredClassroomRecord {
   id: string;
   name: string;
+  grade?: string;
+  schoolYear?: string;
+  description?: string;
+  joinCode?: string;
+  allowJoinByCode?: boolean;
   teacherUid: string;
   teacherName: string;
   status: 'active' | 'archived';
@@ -955,6 +961,27 @@ export interface StoredClassroomRecord {
   maxCapacity: number; // Always 50
   createdAt: string;
   updatedAt: string;
+}
+
+export interface StoredClassJoinRequest {
+  id: string;
+  classId: string;
+  className: string;
+  grade?: string;
+  schoolYear?: string;
+  teacherUid: string;
+  teacherName: string;
+  fullName: string;
+  studentCode?: string;
+  notes?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  createdStudentUid?: string;
+  createdStudentUsername?: string;
+  createdActivationCode?: string;
+  activationCodeExpiresAt?: string;
+  rejectionReason?: string;
+  createdAt: string;
+  reviewedAt?: string;
 }
 
 export interface StoredAdminAuditLog {
@@ -999,6 +1026,75 @@ function getExpiryDateServer(days = 7): string {
   const date = new Date();
   date.setDate(date.getDate() + days);
   return date.toISOString();
+}
+
+const JOIN_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+function generateUniqueClassJoinCode(
+  existingClasses: StoredClassroomRecord[],
+  className?: string
+): string {
+  const existingCodes = new Set(
+    existingClasses
+      .map((c) => String(c.joinCode || '').trim().toUpperCase())
+      .filter(Boolean)
+  );
+  const cleanPrefix = String(className || 'V12')
+    .replace(/[^A-Za-z0-9]/g, '')
+    .toUpperCase()
+    .slice(0, 4) || 'V12';
+
+  for (let attempt = 0; attempt < 50; attempt++) {
+    let suffix = '';
+    for (let i = 0; i < 4; i++) {
+      suffix += JOIN_CODE_ALPHABET[crypto.randomInt(0, JOIN_CODE_ALPHABET.length)];
+    }
+    const candidate = `${cleanPrefix}-${suffix}`;
+    if (!existingCodes.has(candidate)) {
+      return candidate;
+    }
+  }
+  return `${cleanPrefix}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+}
+
+function inferGradeFromClassName(className: string, explicitGrade?: string): string {
+  const cleanExplicit = String(explicitGrade || '').trim();
+  if (['10', '11', '12'].includes(cleanExplicit)) return cleanExplicit;
+  const match = String(className || '').trim().match(/^(10|11|12)/);
+  return match ? match[1] : '12';
+}
+
+function generateUniqueStudentUsername(
+  existingUsernames: Set<string>,
+  className: string,
+  preferredCode?: string
+): { username: string; isDuplicatePreferred: boolean } {
+  const cleanPreferred = String(preferredCode || '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '');
+  if (cleanPreferred) {
+    if (existingUsernames.has(cleanPreferred)) {
+      return { username: cleanPreferred, isDuplicatePreferred: true };
+    }
+    return { username: cleanPreferred, isDuplicatePreferred: false };
+  }
+
+  const cleanClassPrefix =
+    String(className || '12A1')
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '') || '12A1';
+
+  for (let idx = 1; idx <= 999; idx++) {
+    const numStr = idx < 10 ? `0${idx}` : String(idx);
+    const candidate = `${cleanClassPrefix}-HS${numStr}`;
+    if (!existingUsernames.has(candidate)) {
+      return { username: candidate, isDuplicatePreferred: false };
+    }
+  }
+  const fallback = `${cleanClassPrefix}-HS${crypto.randomInt(1000, 9999)}`;
+  return { username: fallback, isDuplicatePreferred: false };
 }
 
 export function normalizePhoneE164(rawPhone: string): string {
@@ -1154,15 +1250,43 @@ function saveServerClasses(list: StoredClassroomRecord[], throwOnError = false):
   }
 }
 
+function loadClassJoinRequests(): StoredClassJoinRequest[] {
+  try {
+    if (fs.existsSync(CLASS_JOIN_REQUESTS_FILE)) {
+      const raw = fs.readFileSync(CLASS_JOIN_REQUESTS_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch (err) {
+    console.warn('Error reading class join requests file:', err);
+  }
+  return [];
+}
+
+function saveClassJoinRequests(list: StoredClassJoinRequest[], throwOnError = false): boolean {
+  try {
+    ensureDataDirExists();
+    fs.writeFileSync(CLASS_JOIN_REQUESTS_FILE, JSON.stringify(list, null, 2), 'utf-8');
+    return true;
+  } catch (err: any) {
+    console.error('Error saving class join requests:', err);
+    if (throwOnError) {
+      throw new Error(`Không thể lưu yêu cầu tham gia lớp trên máy chủ: ${err?.message || String(err)}`);
+    }
+    return false;
+  }
+}
+
 // ============================================================================
 // UNIFIED CLOUD FIRESTORE + LOCAL STORAGE PERSISTENCE & RECONCILIATION
-// Uses existing collections: /teacher_registrations, /users, /admins, /classes, /student_rosters
+// Uses existing collections: /teacher_registrations, /users, /admins, /classes, /student_rosters, /class_join_requests
 // ============================================================================
 let lastFirestoreHydrationTime = 0;
 let activeHydrationPromise: Promise<{
   accounts: StoredUserAccount[];
   registrations: StoredTeacherRegistration[];
   classes: StoredClassroomRecord[];
+  joinRequests: StoredClassJoinRequest[];
 }> | null = null;
 
 function normalizeFirestoreTimestamp(val: any): string | undefined {
@@ -1519,12 +1643,34 @@ async function hydrateServerStateFromFirestore(force = false): Promise<{
   accounts: StoredUserAccount[];
   registrations: StoredTeacherRegistration[];
   classes: StoredClassroomRecord[];
+  joinRequests: StoredClassJoinRequest[];
 }> {
   const nowMs = Date.now();
   if (!force && nowMs - lastFirestoreHydrationTime < 2500) {
     const localAccounts = loadServerAccounts();
     const localRegistrations = loadTeacherRegistrations();
     const localClasses = loadServerClasses();
+    const localJoinRequests = loadClassJoinRequests();
+    let clsUpdated = false;
+    for (const c of localClasses) {
+      if (c.allowJoinByCode === undefined) {
+        c.allowJoinByCode = true;
+        clsUpdated = true;
+      }
+      if (!c.joinCode && c.allowJoinByCode !== false) {
+        c.joinCode = generateUniqueClassJoinCode(localClasses, c.name);
+        clsUpdated = true;
+      }
+      if (!c.grade) {
+        c.grade = inferGradeFromClassName(c.name);
+        clsUpdated = true;
+      }
+      if (!c.schoolYear) {
+        c.schoolYear = '2025-2026';
+        clsUpdated = true;
+      }
+    }
+    if (clsUpdated) saveServerClasses(localClasses);
     const reconciled = reconcileTeacherRegistrationAndAccountStates(
       localRegistrations,
       localAccounts
@@ -1534,7 +1680,8 @@ async function hydrateServerStateFromFirestore(force = false): Promise<{
     return {
       accounts: localAccounts,
       registrations: localRegistrations,
-      classes: localClasses
+      classes: localClasses,
+      joinRequests: localJoinRequests
     };
   }
   if (activeHydrationPromise) {
@@ -1545,21 +1692,44 @@ async function hydrateServerStateFromFirestore(force = false): Promise<{
     const localAccounts = loadServerAccounts();
     const localRegistrations = loadTeacherRegistrations();
     const localClasses = loadServerClasses();
+    const localJoinRequests = loadClassJoinRequests();
     try {
       const op = await runServerFirestoreOp(async (db) => {
-        const [regSnap, usersSnap, classesSnap] = await Promise.all([
+        const [regSnap, usersSnap, classesSnap, joinReqSnap] = await Promise.all([
           db.collection('teacher_registrations').get(),
           db.collection('users').get(),
-          db.collection('classes').get()
+          db.collection('classes').get(),
+          db.collection('class_join_requests').get().catch(() => ({ docs: [] }))
         ]);
         return {
           regDocs: regSnap.docs.map((d: any) => ({ id: d.id, ...d.data() })),
           userDocs: usersSnap.docs.map((d: any) => ({ id: d.id, ...d.data() })),
-          classDocs: classesSnap.docs.map((d: any) => ({ id: d.id, ...d.data() }))
+          classDocs: classesSnap.docs.map((d: any) => ({ id: d.id, ...d.data() })),
+          joinReqDocs: (joinReqSnap?.docs || []).map((d: any) => ({ id: d.id, ...d.data() }))
         };
       });
 
       if (!op.executed || !op.result) {
+        let clsUpdated = false;
+        for (const c of localClasses) {
+          if (c.allowJoinByCode === undefined) {
+            c.allowJoinByCode = true;
+            clsUpdated = true;
+          }
+          if (!c.joinCode && c.allowJoinByCode !== false) {
+            c.joinCode = generateUniqueClassJoinCode(localClasses, c.name);
+            clsUpdated = true;
+          }
+          if (!c.grade) {
+            c.grade = inferGradeFromClassName(c.name);
+            clsUpdated = true;
+          }
+          if (!c.schoolYear) {
+            c.schoolYear = '2025-2026';
+            clsUpdated = true;
+          }
+        }
+        if (clsUpdated) saveServerClasses(localClasses);
         const { regChanged, accChanged } = reconcileTeacherRegistrationAndAccountStates(
           localRegistrations,
           localAccounts
@@ -1570,14 +1740,16 @@ async function hydrateServerStateFromFirestore(force = false): Promise<{
         return {
           accounts: localAccounts,
           registrations: localRegistrations,
-          classes: localClasses
+          classes: localClasses,
+          joinRequests: localJoinRequests
         };
       }
 
-      const { regDocs, userDocs, classDocs } = op.result;
+      const { regDocs, userDocs, classDocs, joinReqDocs } = op.result;
       let accountsChanged = false;
       let registrationsChanged = false;
       let classesChanged = false;
+      let joinRequestsChanged = false;
 
       // 1. Merge /teacher_registrations
       const regByUid = new Map<string, StoredTeacherRegistration>();
@@ -1703,11 +1875,18 @@ async function hydrateServerStateFromFirestore(force = false): Promise<{
           localAccounts.push(normalizedUser);
           accountsChanged = true;
         } else {
+          const isActivatedNow = Boolean(existing.isActivated || normalizedUser.isActivated);
           Object.assign(existing, {
-            ...existing,
             ...normalizedUser,
-            passwordHash: normalizedUser.passwordHash || existing.passwordHash,
-            passwordSalt: normalizedUser.passwordSalt || existing.passwordSalt
+            ...existing,
+            isActivated: isActivatedNow,
+            status: isActivatedNow && existing.status === 'active' ? 'active' : normalizedUser.status || existing.status,
+            passwordHash: existing.passwordHash || normalizedUser.passwordHash,
+            passwordSalt: existing.passwordSalt || normalizedUser.passwordSalt,
+            activationCode: isActivatedNow ? undefined : existing.activationCode || normalizedUser.activationCode,
+            activationCodeExpiresAt: isActivatedNow
+              ? undefined
+              : existing.activationCodeExpiresAt || normalizedUser.activationCodeExpiresAt
           });
           accountsChanged = true;
         }
@@ -1717,9 +1896,16 @@ async function hydrateServerStateFromFirestore(force = false): Promise<{
       for (const doc of classDocs) {
         const classId = String(doc.id || '').trim();
         if (!classId) continue;
+        const cname = String(doc.name || '').trim().toUpperCase();
         const normalizedClass: StoredClassroomRecord = {
           id: classId,
-          name: String(doc.name || '').trim().toUpperCase(),
+          name: cname,
+          grade: doc.grade ? String(doc.grade).trim() : inferGradeFromClassName(cname),
+          schoolYear: doc.schoolYear ? String(doc.schoolYear).trim() : '2025-2026',
+          description: doc.description ? String(doc.description).trim() : undefined,
+          joinCode: doc.joinCode ? String(doc.joinCode).trim().toUpperCase() : undefined,
+          allowJoinByCode:
+            typeof doc.allowJoinByCode === 'boolean' ? doc.allowJoinByCode : true,
           teacherUid: String(doc.teacherUid || '').trim(),
           teacherName: String(doc.teacherName || '').trim(),
           status: doc.status === 'archived' ? 'archived' : 'active',
@@ -1733,15 +1919,71 @@ async function hydrateServerStateFromFirestore(force = false): Promise<{
         };
         const existingCls = localClasses.find((c) => c.id === classId);
         if (!existingCls) {
+          if (!normalizedClass.joinCode && normalizedClass.allowJoinByCode !== false) {
+            normalizedClass.joinCode = generateUniqueClassJoinCode(
+              localClasses,
+              normalizedClass.name
+            );
+          }
           localClasses.push(normalizedClass);
           classesChanged = true;
         } else {
           const remoteTime = new Date(normalizedClass.updatedAt || 0).getTime();
           const localTime = new Date(existingCls.updatedAt || 0).getTime();
           if (remoteTime >= localTime) {
-            Object.assign(existingCls, normalizedClass);
+            Object.assign(existingCls, {
+              ...existingCls,
+              ...normalizedClass,
+              joinCode: normalizedClass.joinCode ?? existingCls.joinCode
+            });
             classesChanged = true;
           }
+        }
+      }
+
+      for (const c of localClasses) {
+        if (c.allowJoinByCode === undefined) {
+          c.allowJoinByCode = true;
+          classesChanged = true;
+        }
+        if (!c.joinCode && c.allowJoinByCode !== false) {
+          c.joinCode = generateUniqueClassJoinCode(localClasses, c.name);
+          classesChanged = true;
+        }
+      }
+
+      // 4. Merge /class_join_requests
+      for (const doc of joinReqDocs) {
+        const reqId = String(doc.id || '').trim();
+        if (!reqId) continue;
+        const normalizedReq: StoredClassJoinRequest = {
+          id: reqId,
+          classId: String(doc.classId || '').trim(),
+          className: String(doc.className || '').trim().toUpperCase(),
+          grade: doc.grade ? String(doc.grade).trim() : undefined,
+          schoolYear: doc.schoolYear ? String(doc.schoolYear).trim() : undefined,
+          teacherUid: String(doc.teacherUid || '').trim(),
+          teacherName: String(doc.teacherName || '').trim(),
+          fullName: String(doc.fullName || '').trim(),
+          studentCode: doc.studentCode ? String(doc.studentCode).trim().toUpperCase() : undefined,
+          notes: doc.notes ? String(doc.notes).trim() : undefined,
+          status:
+            doc.status === 'approved' || doc.status === 'rejected' ? doc.status : 'pending',
+          createdStudentUid: doc.createdStudentUid || undefined,
+          createdStudentUsername: doc.createdStudentUsername || undefined,
+          createdActivationCode: doc.createdActivationCode || undefined,
+          activationCodeExpiresAt: normalizeFirestoreTimestamp(doc.activationCodeExpiresAt),
+          rejectionReason: doc.rejectionReason || undefined,
+          createdAt: normalizeFirestoreTimestamp(doc.createdAt) || new Date().toISOString(),
+          reviewedAt: normalizeFirestoreTimestamp(doc.reviewedAt)
+        };
+        const existingReq = localJoinRequests.find((r) => r.id === reqId);
+        if (!existingReq) {
+          localJoinRequests.unshift(normalizedReq);
+          joinRequestsChanged = true;
+        } else {
+          Object.assign(existingReq, normalizedReq);
+          joinRequestsChanged = true;
         }
       }
 
@@ -1758,19 +2000,24 @@ async function hydrateServerStateFromFirestore(force = false): Promise<{
       if (classesChanged) {
         saveServerClasses(localClasses);
       }
+      if (joinRequestsChanged) {
+        saveClassJoinRequests(localJoinRequests);
+      }
 
       lastFirestoreHydrationTime = Date.now();
       return {
         accounts: localAccounts,
         registrations: localRegistrations,
-        classes: localClasses
+        classes: localClasses,
+        joinRequests: localJoinRequests
       };
     } catch (err) {
       console.warn('[FirestoreSync] Lỗi đồng bộ từ Firestore:', err);
       return {
         accounts: localAccounts,
         registrations: localRegistrations,
-        classes: localClasses
+        classes: localClasses,
+        joinRequests: localJoinRequests
       };
     } finally {
       activeHydrationPromise = null;
@@ -1924,7 +2171,7 @@ async function persistClassroomToStores(
     }
     const firestoreSync = await runServerFirestoreOp(async (db, FieldValue) => {
       const docRef = db.collection('classes').doc(cls.id);
-      const safePayload = buildFirestoreSafePayload({ ...cls }, FieldValue);
+      const safePayload = buildFirestoreSafePayload({ ...cls }, FieldValue, ['joinCode']);
       await docRef.set(safePayload, { merge: true });
     });
     if (firestoreSync.error) {
@@ -2002,6 +2249,97 @@ async function persistStudentAccountToStores(
     return {
       saved: false,
       error: err?.message || 'Lỗi khi lưu tài khoản học sinh.'
+    };
+  }
+}
+
+async function persistBatchStudentsToStores(
+  newAccounts: StoredUserAccount[],
+  allAccounts: StoredUserAccount[],
+  updatedClasses: StoredClassroomRecord[]
+): Promise<{ saved: boolean; error?: string }> {
+  try {
+    const savedAccs = saveServerAccounts(allAccounts, false);
+    const savedCls = saveServerClasses(updatedClasses, false);
+    if (!savedAccs || !savedCls) {
+      return {
+        saved: false,
+        error: 'Không thể lưu danh sách học sinh hàng loạt vào bộ nhớ máy chủ.'
+      };
+    }
+    if (newAccounts.length > 0) {
+      await runServerFirestoreOp(async (db, FieldValue) => {
+        const batch = db.batch();
+        for (const studentAcc of newAccounts.slice(0, 150)) {
+          const userRef = db.collection('users').doc(studentAcc.id);
+          batch.set(
+            userRef,
+            buildFirestoreSafePayload({ ...studentAcc, uid: studentAcc.id }, FieldValue, [
+              'activationCode',
+              'activationCodeExpiresAt'
+            ]),
+            { merge: true }
+          );
+          const rosterRef = db.collection('student_rosters').doc(studentAcc.id);
+          batch.set(
+            rosterRef,
+            buildFirestoreSafePayload(
+              {
+                id: studentAcc.id,
+                username: studentAcc.username,
+                fullName: studentAcc.fullName,
+                className: studentAcc.className || '',
+                classId: studentAcc.classId || '',
+                teacherUid: studentAcc.teacherUid || '',
+                email: studentAcc.email,
+                isActivated: Boolean(studentAcc.isActivated),
+                status: studentAcc.status,
+                createdAt: studentAcc.createdAt
+              },
+              FieldValue
+            ),
+            { merge: true }
+          );
+        }
+        for (const cls of updatedClasses) {
+          const clsRef = db.collection('classes').doc(cls.id);
+          batch.set(clsRef, buildFirestoreSafePayload({ ...cls }, FieldValue), {
+            merge: true
+          });
+        }
+        await batch.commit();
+      });
+    }
+    return { saved: true };
+  } catch (err: any) {
+    return {
+      saved: false,
+      error: err?.message || 'Lỗi khi lưu danh sách học sinh hàng loạt.'
+    };
+  }
+}
+
+async function persistClassJoinRequestToStores(
+  reqItem: StoredClassJoinRequest,
+  allRequests: StoredClassJoinRequest[]
+): Promise<{ saved: boolean; error?: string }> {
+  try {
+    const savedLocal = saveClassJoinRequests(allRequests, false);
+    if (!savedLocal) {
+      return {
+        saved: false,
+        error: 'Không thể lưu yêu cầu tham gia lớp trên máy chủ.'
+      };
+    }
+    await runServerFirestoreOp(async (db, FieldValue) => {
+      const docRef = db.collection('class_join_requests').doc(reqItem.id);
+      await docRef.set(buildFirestoreSafePayload({ ...reqItem }, FieldValue), { merge: true });
+    });
+    return { saved: true };
+  } catch (err: any) {
+    return {
+      saved: false,
+      error: err?.message || 'Lỗi khi lưu yêu cầu tham gia lớp.'
     };
   }
 }
@@ -2840,18 +3178,27 @@ function sanitizeAccountForClient(acc: StoredUserAccount, includeActivationCode 
 
 function enrichClassroomForClient(
   cls: StoredClassroomRecord,
-  accounts: StoredUserAccount[]
-): StoredClassroomRecord & { remainingSeats: number } {
+  accounts: StoredUserAccount[],
+  joinRequests?: StoredClassJoinRequest[]
+): StoredClassroomRecord & { remainingSeats: number; pendingJoinCount: number } {
   const enrolledCount = accounts.filter(
     (a) =>
       a.role === 'student' &&
       (a.classId === cls.id || (a.teacherUid === cls.teacherUid && a.className === cls.name))
   ).length;
+  const allReqs = joinRequests || loadClassJoinRequests();
+  const pendingJoinCount = allReqs.filter(
+    (r) => r.classId === cls.id && r.status === 'pending'
+  ).length;
   return {
     ...cls,
+    grade: cls.grade || inferGradeFromClassName(cls.name),
+    schoolYear: cls.schoolYear || '2025-2026',
+    allowJoinByCode: cls.allowJoinByCode !== undefined ? cls.allowJoinByCode : true,
     enrolledCount,
     maxCapacity: MAX_ENROLLED_STUDENTS_PER_CLASS,
-    remainingSeats: Math.max(0, MAX_ENROLLED_STUDENTS_PER_CLASS - enrolledCount)
+    remainingSeats: Math.max(0, MAX_ENROLLED_STUDENTS_PER_CLASS - enrolledCount),
+    pendingJoinCount
   };
 }
 
@@ -4572,13 +4919,16 @@ export function createApiApp(): express.Express {
     const hydrated = await hydrateServerStateFromFirestore(false);
     const classes = hydrated.classes;
     const accounts = hydrated.accounts;
+    const joinRequests = hydrated.joinRequests;
 
     const scopedClasses =
       session.role === 'admin'
         ? classes
         : classes.filter((c) => c.teacherUid === session.uid);
 
-    const enriched = scopedClasses.map((c) => enrichClassroomForClient(c, accounts));
+    const enriched = scopedClasses.map((c) =>
+      enrichClassroomForClient(c, accounts, joinRequests)
+    );
     const activeClassesCount = enriched.filter((c) => c.status === 'active').length;
 
     res.json({
@@ -4598,6 +4948,7 @@ export function createApiApp(): express.Express {
     const hydrated = await hydrateServerStateFromFirestore(false);
     const classes = hydrated.classes;
     const accounts = hydrated.accounts;
+    const joinRequests = hydrated.joinRequests;
 
     if (authUser.role === 'student') {
       const myClass = classes.find(
@@ -4606,19 +4957,38 @@ export function createApiApp(): express.Express {
           (authUser.teacherUid && c.teacherUid === authUser.teacherUid && c.name === authUser.className) ||
           c.name === authUser.className
       );
+      if (!myClass) {
+        res.json({ classroom: null });
+        return;
+      }
+      // Sanitize for student: never expose teacher joinCode management internals if not needed
+      const enriched = enrichClassroomForClient(myClass, accounts, joinRequests);
       res.json({
-        classroom: myClass ? enrichClassroomForClient(myClass, accounts) : null
+        classroom: {
+          id: enriched.id,
+          name: enriched.name,
+          grade: enriched.grade,
+          schoolYear: enriched.schoolYear,
+          description: enriched.description,
+          teacherUid: enriched.teacherUid,
+          teacherName: enriched.teacherName,
+          status: enriched.status,
+          enrolledCount: enriched.enrolledCount,
+          maxCapacity: enriched.maxCapacity,
+          remainingSeats: enriched.remainingSeats,
+          createdAt: enriched.createdAt
+        }
       });
       return;
     }
 
     const myClasses = classes
       .filter((c) => c.teacherUid === authUser.id)
-      .map((c) => enrichClassroomForClient(c, accounts));
+      .map((c) => enrichClassroomForClient(c, accounts, joinRequests));
     res.json({ classrooms: myClasses });
   });
 
-  // Create a new Classroom (Enforces max 5 active classes per teacher atomically)
+  // Create a new Classroom (Enforces max 5 active classes per teacher atomically + generates joinCode)
   app.post('/api/classes', requireTeacherAuth, async (req, res) => {
     const session = (req as any).authSession as SessionTokenPayload;
     const authUser = (req as any).authUser as StoredUserAccount;
@@ -4635,13 +5005,22 @@ export function createApiApp(): express.Express {
       res.status(400).json({ error: 'Vui lòng nhập tên lớp học (VD: 12A1).' });
       return;
     }
+    if (rawName.length > 40) {
+      res.status(400).json({ error: 'Tên lớp học không được vượt quá 40 ký tự.' });
+      return;
+    }
 
     const normalizedName = rawName.toUpperCase();
+    const grade = inferGradeFromClassName(normalizedName, req.body?.grade);
+    const schoolYear = String(req.body?.schoolYear || '2025-2026').trim() || '2025-2026';
+    const description = req.body?.description ? String(req.body.description).trim().slice(0, 500) : undefined;
+    const allowJoinByCode = req.body?.allowJoinByCode !== undefined ? Boolean(req.body.allowJoinByCode) : true;
 
     await withQuotaLock(async () => {
       const hydrated = await hydrateServerStateFromFirestore(true);
       const classes = hydrated.classes;
       const accounts = hydrated.accounts;
+      const joinRequests = hydrated.joinRequests;
       const effectiveTeacherUid = authUser.id;
 
       const teacherActiveClasses = classes.filter(
@@ -4673,9 +5052,15 @@ export function createApiApp(): express.Express {
       }
 
       const now = new Date().toISOString();
+      const joinCode = generateUniqueClassJoinCode(classes, normalizedName);
       const newClass: StoredClassroomRecord = {
         id: `cls-${crypto.randomUUID()}`,
         name: normalizedName,
+        grade,
+        schoolYear,
+        description,
+        joinCode,
+        allowJoinByCode,
         teacherUid: effectiveTeacherUid,
         teacherName: authUser.fullName,
         status: 'active',
@@ -4697,28 +5082,457 @@ export function createApiApp(): express.Express {
       const newActiveCount = teacherActiveClasses.length + 1;
       res.json({
         success: true,
-        classroom: enrichClassroomForClient(newClass, accounts),
+        classroom: enrichClassroomForClient(newClass, accounts, joinRequests),
         quota: {
           activeClassesCount: newActiveCount,
           maxActiveClasses: MAX_ACTIVE_CLASSES_PER_TEACHER,
           remainingClassesQuota: Math.max(0, MAX_ACTIVE_CLASSES_PER_TEACHER - newActiveCount)
         },
-        message: `Đã tạo lớp ${normalizedName} thành công! Bạn đã dùng ${newActiveCount}/${MAX_ACTIVE_CLASSES_PER_TEACHER} lớp (còn tạo được ${Math.max(
-          0,
-          MAX_ACTIVE_CLASSES_PER_TEACHER - newActiveCount
-        )} lớp).`
+        message: `Đã tạo lớp ${normalizedName} (Khối ${grade} · Năm học ${schoolYear}) thành công! Mã tham gia lớp: ${joinCode}.`
       });
     });
   });
 
-  // Enroll a Student into a Teacher's Class (Enforces max 50 students/class, anti-duplicate, cross-teacher RBAC, and concurrency lock)
+  // Manage Classroom Join Code (Toggle / Regenerate / Revoke) - Teacher Owner Only
+  app.post('/api/classes/:classId/join-code', requireTeacherAuth, async (req, res) => {
+    const session = (req as any).authSession as SessionTokenPayload;
+    const classId = String(req.params.classId || '').trim();
+    const { action, allowJoinByCode } = req.body || {};
+
+    const hydrated = await hydrateServerStateFromFirestore(true);
+    const classes = hydrated.classes;
+    const accounts = hydrated.accounts;
+    const joinRequests = hydrated.joinRequests;
+
+    const targetClass = classes.find((c) => c.id === classId || c.name.toUpperCase() === classId.toUpperCase());
+    if (!targetClass) {
+      res.status(404).json({ error: 'Không tìm thấy lớp học.' });
+      return;
+    }
+
+    if (session.role !== 'admin' && targetClass.teacherUid !== session.uid) {
+      res.status(403).json({
+        error: 'Từ chối truy cập (403): Bạn chỉ được phép quản lí mã tham gia của lớp học do chính mình phụ trách.'
+      });
+      return;
+    }
+
+    if (action === 'regenerate') {
+      targetClass.joinCode = generateUniqueClassJoinCode(classes, targetClass.name);
+      targetClass.allowJoinByCode = true;
+    } else if (action === 'revoke') {
+      targetClass.allowJoinByCode = false;
+      targetClass.joinCode = undefined;
+    } else {
+      const nextAllow =
+        typeof allowJoinByCode === 'boolean' ? allowJoinByCode : !targetClass.allowJoinByCode;
+      targetClass.allowJoinByCode = nextAllow;
+      if (nextAllow && !targetClass.joinCode) {
+        targetClass.joinCode = generateUniqueClassJoinCode(classes, targetClass.name);
+      }
+    }
+    targetClass.updatedAt = new Date().toISOString();
+
+    const persisted = await persistClassroomToStores(targetClass, classes);
+    if (!persisted.saved) {
+      res.status(500).json({
+        error: persisted.error || 'Không thể lưu thay đổi mã tham gia lớp.'
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      classroom: enrichClassroomForClient(targetClass, accounts, joinRequests),
+      message:
+        action === 'regenerate'
+          ? `Đã tạo mã tham gia lớp mới: ${targetClass.joinCode}`
+          : action === 'revoke'
+          ? `Đã thu hồi và tắt mã tham gia của lớp ${targetClass.name}.`
+          : targetClass.allowJoinByCode
+          ? `Đã bật tham gia lớp bằng mã (${targetClass.joinCode}).`
+          : `Đã tạm khóa tham gia lớp bằng mã.`
+    });
+  });
+
+  // Student submits a request to join a class by joinCode (Requires teacher approval; NEVER leaks class roster or other students' data)
+  app.post('/api/classes/join-by-code', async (req, res) => {
+    const rawJoinCode = String(req.body?.joinCode || '').trim().toUpperCase();
+    const rawFullName = String(req.body?.fullName || '').trim();
+    const rawStudentCode = req.body?.studentCode
+      ? String(req.body.studentCode).trim().toUpperCase().replace(/\s+/g, '')
+      : undefined;
+    const rawNotes = req.body?.notes ? String(req.body.notes).trim().slice(0, 300) : undefined;
+
+    if (!rawJoinCode) {
+      res.status(400).json({
+        success: false,
+        error: 'Vui lòng nhập Mã tham gia lớp do giáo viên cung cấp.'
+      });
+      return;
+    }
+    if (!rawFullName || rawFullName.length < 2) {
+      res.status(400).json({
+        success: false,
+        error: 'Vui lòng nhập đầy đủ Họ và tên học sinh (tối thiểu 2 ký tự).'
+      });
+      return;
+    }
+
+    await withQuotaLock(async () => {
+      const hydrated = await hydrateServerStateFromFirestore(true);
+      const classes = hydrated.classes;
+      const accounts = hydrated.accounts;
+      const joinRequests = hydrated.joinRequests;
+
+      const targetClass = classes.find(
+        (c) =>
+          c.status === 'active' &&
+          c.joinCode &&
+          c.joinCode.trim().toUpperCase() === rawJoinCode
+      );
+
+      if (!targetClass || targetClass.allowJoinByCode === false) {
+        res.status(404).json({
+          success: false,
+          error:
+            'Mã tham gia lớp không tồn tại, đã bị giáo viên thu hồi hoặc lớp hiện đang khóa nhận học sinh qua mã.'
+        });
+        return;
+      }
+
+      const enrolledInClass = accounts.filter(
+        (a) =>
+          a.role === 'student' &&
+          (a.classId === targetClass.id ||
+            (a.teacherUid === targetClass.teacherUid &&
+              (a.className || '').toUpperCase() === targetClass.name.toUpperCase()))
+      );
+
+      if (enrolledInClass.length >= MAX_ENROLLED_STUDENTS_PER_CLASS) {
+        res.status(403).json({
+          success: false,
+          code: 'MAX_STUDENTS_QUOTA_EXCEEDED',
+          error: `Lớp ${targetClass.name} đã đạt sĩ số tối đa ${MAX_ENROLLED_STUDENTS_PER_CLASS}/${MAX_ENROLLED_STUDENTS_PER_CLASS} học sinh, không thể nhận thêm thành viên mới.`
+        });
+        return;
+      }
+
+      if (
+        rawStudentCode &&
+        enrolledInClass.some((a) => a.username.toUpperCase() === rawStudentCode)
+      ) {
+        res.status(409).json({
+          success: false,
+          error: `Mã học sinh "${rawStudentCode}" đã có trong lớp ${targetClass.name}. Nếu bạn đã được giáo viên cấp tài khoản, vui lòng chuyển sang tab "Kích hoạt HS" hoặc "Đăng nhập".`
+        });
+        return;
+      }
+
+      const existingPending = joinRequests.find(
+        (r) =>
+          r.classId === targetClass.id &&
+          r.status === 'pending' &&
+          r.fullName.toLowerCase() === rawFullName.toLowerCase() &&
+          (r.studentCode || '') === (rawStudentCode || '')
+      );
+
+      if (existingPending) {
+        res.json({
+          success: true,
+          request: {
+            id: existingPending.id,
+            classId: existingPending.classId,
+            className: existingPending.className,
+            grade: existingPending.grade || targetClass.grade || '12',
+            schoolYear: existingPending.schoolYear || targetClass.schoolYear || '2025-2026',
+            teacherName: existingPending.teacherName,
+            fullName: existingPending.fullName,
+            studentCode: existingPending.studentCode,
+            status: existingPending.status,
+            createdAt: existingPending.createdAt
+          },
+          message: `Yêu cầu tham gia lớp ${targetClass.name} của bạn đã được gửi trước đó và đang chờ giáo viên ${targetClass.teacherName} phê duyệt.`
+        });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const newReq: StoredClassJoinRequest = {
+        id: `jreq-${crypto.randomUUID()}`,
+        classId: targetClass.id,
+        className: targetClass.name,
+        grade: targetClass.grade || inferGradeFromClassName(targetClass.name),
+        schoolYear: targetClass.schoolYear || '2025-2026',
+        teacherUid: targetClass.teacherUid,
+        teacherName: targetClass.teacherName,
+        fullName: rawFullName,
+        studentCode: rawStudentCode,
+        notes: rawNotes,
+        status: 'pending',
+        createdAt: now
+      };
+
+      joinRequests.unshift(newReq);
+      const persisted = await persistClassJoinRequestToStores(newReq, joinRequests);
+      if (!persisted.saved) {
+        res.status(500).json({
+          success: false,
+          error: persisted.error || 'Không thể lưu yêu cầu tham gia lớp vào cơ sở dữ liệu.'
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        request: {
+          id: newReq.id,
+          classId: newReq.classId,
+          className: newReq.className,
+          grade: newReq.grade,
+          schoolYear: newReq.schoolYear,
+          teacherName: newReq.teacherName,
+          fullName: newReq.fullName,
+          studentCode: newReq.studentCode,
+          status: newReq.status,
+          createdAt: newReq.createdAt
+        },
+        message: `Đã gửi yêu cầu tham gia lớp ${targetClass.name} (GV: ${targetClass.teacherName}). Vui lòng chờ giáo viên duyệt để nhận Mã học sinh và Mã kích hoạt 6 số.`
+      });
+    });
+  });
+
+  // Student checks the approval status of their own join request by requestId (never exposes other students)
+  app.get('/api/classes/join-request-status/:requestId', async (req, res) => {
+    const requestId = String(req.params.requestId || '').trim();
+    if (!requestId) {
+      res.status(400).json({ found: false, error: 'Thiếu mã yêu cầu tham gia lớp.' });
+      return;
+    }
+
+    const hydrated = await hydrateServerStateFromFirestore(false);
+    const joinRequests = hydrated.joinRequests;
+    const accounts = hydrated.accounts;
+
+    const reqItem = joinRequests.find(
+      (r) => r.id.toLowerCase() === requestId.toLowerCase()
+    );
+    if (!reqItem) {
+      res.status(404).json({
+        found: false,
+        error: 'Không tìm thấy yêu cầu tham gia lớp với mã này.'
+      });
+      return;
+    }
+
+    const createdAcc = reqItem.createdStudentUid
+      ? accounts.find((a) => a.id === reqItem.createdStudentUid)
+      : undefined;
+    const isAlreadyActivated = Boolean(createdAcc?.isActivated);
+
+    res.json({
+      found: true,
+      request: {
+        id: reqItem.id,
+        classId: reqItem.classId,
+        className: reqItem.className,
+        grade: reqItem.grade,
+        schoolYear: reqItem.schoolYear,
+        teacherName: reqItem.teacherName,
+        fullName: reqItem.fullName,
+        studentCode: reqItem.studentCode,
+        status: reqItem.status,
+        createdStudentUsername: reqItem.createdStudentUsername,
+        createdActivationCode: isAlreadyActivated
+          ? undefined
+          : createdAcc?.activationCode || reqItem.createdActivationCode,
+        activationCodeExpiresAt: isAlreadyActivated
+          ? undefined
+          : createdAcc?.activationCodeExpiresAt || reqItem.activationCodeExpiresAt,
+        isAccountActivated: isAlreadyActivated,
+        rejectionReason: reqItem.rejectionReason,
+        createdAt: reqItem.createdAt,
+        reviewedAt: reqItem.reviewedAt
+      }
+    });
+  });
+
+  // Teacher lists join requests for their own classes
+  app.get('/api/classes/join-requests', requireTeacherAuth, async (req, res) => {
+    const session = (req as any).authSession as SessionTokenPayload;
+    const classFilter = req.query?.className ? String(req.query.className).trim().toUpperCase() : '';
+    const hydrated = await hydrateServerStateFromFirestore(false);
+    const joinRequests = hydrated.joinRequests;
+
+    const scoped = joinRequests.filter((r) => {
+      if (session.role !== 'admin' && r.teacherUid !== session.uid) return false;
+      if (classFilter && classFilter !== 'ALL' && r.className.toUpperCase() !== classFilter) {
+        return false;
+      }
+      return true;
+    });
+
+    res.json({
+      requests: scoped
+    });
+  });
+
+  // Teacher approves or rejects a student's class join request
+  app.post('/api/classes/join-requests/:requestId/review', requireTeacherAuth, async (req, res) => {
+    const session = (req as any).authSession as SessionTokenPayload;
+    const requestId = String(req.params.requestId || '').trim();
+    const { action, studentCode: overrideStudentCode, reason } = req.body || {};
+
+    if (!['approve', 'reject'].includes(action)) {
+      res.status(400).json({ error: 'Hành động duyệt không hợp lệ (approve | reject).' });
+      return;
+    }
+
+    await withQuotaLock(async () => {
+      const hydrated = await hydrateServerStateFromFirestore(true);
+      const joinRequests = hydrated.joinRequests;
+      const classes = hydrated.classes;
+      const accounts = hydrated.accounts;
+
+      const reqItem = joinRequests.find((r) => r.id === requestId);
+      if (!reqItem) {
+        res.status(404).json({ error: 'Không tìm thấy yêu cầu tham gia lớp.' });
+        return;
+      }
+
+      if (session.role !== 'admin' && reqItem.teacherUid !== session.uid) {
+        res.status(403).json({
+          error: 'Từ chối truy cập (403): Bạn chỉ được phép duyệt yêu cầu tham gia vào lớp do chính mình phụ trách.'
+        });
+        return;
+      }
+
+      if (reqItem.status !== 'pending') {
+        res.status(400).json({
+          error: `Yêu cầu này đã được xử lí trước đó (${reqItem.status === 'approved' ? 'Đã duyệt' : 'Đã từ chối'}).`
+        });
+        return;
+      }
+
+      const now = new Date().toISOString();
+
+      if (action === 'reject') {
+        reqItem.status = 'rejected';
+        reqItem.rejectionReason = String(reason || 'Giáo viên từ chối yêu cầu tham gia lớp.').trim();
+        reqItem.reviewedAt = now;
+        const persisted = await persistClassJoinRequestToStores(reqItem, joinRequests);
+        if (!persisted.saved) {
+          res.status(500).json({ error: persisted.error || 'Không thể lưu trạng thái từ chối.' });
+          return;
+        }
+        res.json({
+          success: true,
+          request: reqItem,
+          message: `Đã từ chối yêu cầu tham gia lớp của "${reqItem.fullName}".`
+        });
+        return;
+      }
+
+      // action === 'approve'
+      const targetClass = classes.find((c) => c.id === reqItem.classId);
+      if (!targetClass || targetClass.status !== 'active') {
+        res.status(400).json({ error: 'Lớp học không tồn tại hoặc đã ngừng hoạt động.' });
+        return;
+      }
+
+      const enrolledInClass = accounts.filter(
+        (a) =>
+          a.role === 'student' &&
+          (a.classId === targetClass.id ||
+            (a.teacherUid === targetClass.teacherUid &&
+              (a.className || '').toUpperCase() === targetClass.name.toUpperCase()))
+      );
+
+      if (enrolledInClass.length >= MAX_ENROLLED_STUDENTS_PER_CLASS) {
+        res.status(403).json({
+          error: `Không thể duyệt: Lớp ${targetClass.name} đã đạt giới hạn tối đa ${MAX_ENROLLED_STUDENTS_PER_CLASS}/${MAX_ENROLLED_STUDENTS_PER_CLASS} học sinh.`,
+          code: 'MAX_STUDENTS_QUOTA_EXCEEDED'
+        });
+        return;
+      }
+
+      const existingSet = new Set(accounts.map((a) => a.username.toUpperCase()));
+      const preferred = overrideStudentCode
+        ? String(overrideStudentCode).trim().toUpperCase()
+        : reqItem.studentCode;
+
+      let assignedUsername = '';
+      if (preferred && !existingSet.has(preferred)) {
+        assignedUsername = preferred;
+      } else {
+        assignedUsername = generateUniqueStudentUsername(existingSet, targetClass.name).username;
+      }
+
+      const activationCode = generateActivationCodeServer();
+      const activationCodeExpiresAt = getExpiryDateServer(14);
+      const newAccount: StoredUserAccount = {
+        id: `uid-hs-${crypto.randomUUID()}`,
+        username: assignedUsername,
+        fullName: reqItem.fullName,
+        role: 'student',
+        className: targetClass.name,
+        classId: targetClass.id,
+        teacherUid: targetClass.teacherUid,
+        isActivated: false,
+        activationCode,
+        activationCodeExpiresAt,
+        status: 'pending_activation',
+        createdAt: now,
+        notes: reqItem.notes || 'Tham gia lớp bằng mã lớp (Đã được GV duyệt)'
+      };
+
+      accounts.unshift(newAccount);
+      targetClass.enrolledCount = enrolledInClass.length + 1;
+      targetClass.updatedAt = now;
+
+      reqItem.status = 'approved';
+      reqItem.createdStudentUid = newAccount.id;
+      reqItem.createdStudentUsername = newAccount.username;
+      reqItem.createdActivationCode = activationCode;
+      reqItem.activationCodeExpiresAt = activationCodeExpiresAt;
+      reqItem.reviewedAt = now;
+
+      const persistedStudent = await persistStudentAccountToStores(
+        newAccount,
+        accounts,
+        targetClass,
+        classes
+      );
+      const persistedReq = await persistClassJoinRequestToStores(reqItem, joinRequests);
+
+      if (!persistedStudent.saved || !persistedReq.saved) {
+        res.status(500).json({
+          error:
+            persistedStudent.error ||
+            persistedReq.error ||
+            'Không thể lưu tài khoản học sinh sau khi duyệt yêu cầu.'
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        request: reqItem,
+        account: sanitizeAccountForClient(newAccount, true),
+        classroom: enrichClassroomForClient(targetClass, accounts, joinRequests),
+        message: `Đã duyệt học sinh "${newAccount.fullName}" vào lớp ${targetClass.name}. Mã đăng nhập: ${newAccount.username} · Mã kích hoạt 1 lần: ${activationCode}`
+      });
+    });
+  });
+
+  // Enroll a Student into a Teacher's Class (Enforces max 50 students/class, optional student code, no Gmail required, cross-teacher RBAC)
   app.post('/api/accounts/student', requireTeacherAuth, async (req, res) => {
     const session = (req as any).authSession as SessionTokenPayload;
     const authUser = (req as any).authUser as StoredUserAccount;
     const { username, fullName, className, classId, email, notes } = req.body || {};
 
-    if (!username || !fullName || (!className && !classId)) {
-      res.status(400).json({ error: 'Vui lòng nhập đủ Mã học sinh, Họ tên và Lớp.' });
+    if (!fullName || (!className && !classId)) {
+      res.status(400).json({ error: 'Vui lòng nhập đủ Họ và tên học sinh và Lớp học.' });
       return;
     }
 
@@ -4726,9 +5540,9 @@ export function createApiApp(): express.Express {
       const hydrated = await hydrateServerStateFromFirestore(true);
       const accounts = hydrated.accounts;
       const classes = hydrated.classes;
+      const joinRequests = hydrated.joinRequests;
       const effectiveTeacherUid = authUser.id;
 
-      const normalizedUsername = String(username).trim().toUpperCase();
       const normalizedFullName = String(fullName).trim();
       const normalizedEmail = email ? String(email).trim().toLowerCase() : undefined;
       const targetClassName = String(className || '').trim().toUpperCase();
@@ -4754,6 +5568,17 @@ export function createApiApp(): express.Express {
         res.status(404).json({ error: 'Không tìm thấy lớp học được chỉ định.' });
         return;
       }
+      if (!targetClass && targetClassName && session.role !== 'admin') {
+        const foreignClass = classes.find(
+          (c) => c.name.toUpperCase() === targetClassName && c.teacherUid !== effectiveTeacherUid
+        );
+        if (foreignClass) {
+          res.status(403).json({
+            error: `Từ chối truy cập (403): Lớp "${targetClassName}" thuộc quyền quản lí của giáo viên khác.`
+          });
+          return;
+        }
+      }
 
       // If teacher does not have this class yet, auto-create ONLY if within 5-class quota
       if (!targetClass) {
@@ -4771,6 +5596,10 @@ export function createApiApp(): express.Express {
         targetClass = {
           id: `cls-${crypto.randomUUID()}`,
           name: targetClassName,
+          grade: inferGradeFromClassName(targetClassName),
+          schoolYear: '2025-2026',
+          joinCode: generateUniqueClassJoinCode(classes, targetClassName),
+          allowJoinByCode: true,
           teacherUid: effectiveTeacherUid,
           teacherName: authUser.fullName,
           status: 'active',
@@ -4787,16 +5616,22 @@ export function createApiApp(): express.Express {
         return;
       }
 
-      // 2. Anti-duplicate check (Prevent duplicate student code or duplicate email in class)
-      const duplicateByCode = accounts.find(
-        (a) => a.username.toUpperCase() === normalizedUsername
+      // 2. Resolve or auto-generate unique student username
+      const existingSet = new Set(accounts.map((a) => a.username.toUpperCase()));
+      const preferredCode = username ? String(username).trim().toUpperCase() : '';
+      const genResult = generateUniqueStudentUsername(
+        existingSet,
+        targetClass.name,
+        preferredCode
       );
-      if (duplicateByCode) {
+
+      if (genResult.isDuplicatePreferred) {
         res.status(409).json({
-          error: `Chống ghi danh trùng: Mã học sinh "${normalizedUsername}" đã tồn tại trong danh sách.`
+          error: `Chống ghi danh trùng: Mã học sinh "${genResult.username}" đã tồn tại trong danh sách.`
         });
         return;
       }
+      const normalizedUsername = genResult.username;
 
       const enrolledInClass = accounts.filter(
         (a) =>
@@ -4823,7 +5658,7 @@ export function createApiApp(): express.Express {
             MAX_ENROLLED_STUDENTS_PER_CLASS + 1
           }.`,
           code: 'MAX_STUDENTS_QUOTA_EXCEEDED',
-          classroom: enrichClassroomForClient(targetClass, accounts)
+          classroom: enrichClassroomForClient(targetClass, accounts, joinRequests)
         });
         return;
       }
@@ -4864,7 +5699,7 @@ export function createApiApp(): express.Express {
 
       res.json({
         account: sanitizeAccountForClient(newAccount, true),
-        classroom: enrichClassroomForClient(targetClass, accounts)
+        classroom: enrichClassroomForClient(targetClass, accounts, joinRequests)
       });
     });
   });
@@ -4872,31 +5707,84 @@ export function createApiApp(): express.Express {
   app.post('/api/accounts/batch', requireTeacherAuth, async (req, res) => {
     const session = (req as any).authSession as SessionTokenPayload;
     const authUser = (req as any).authUser as StoredUserAccount;
-    const { rows } = req.body || {};
-    if (!Array.isArray(rows)) {
-      res.status(400).json({ error: 'Dữ liệu danh sách không hợp lệ.' });
+    const { rows, classId: defaultClassId, className: defaultClassName } = req.body || {};
+    if (!Array.isArray(rows) || rows.length === 0) {
+      res.status(400).json({
+        error: 'Danh sách học sinh trống hoặc không đúng định dạng. Vui lòng kiểm tra lại tệp Excel (.xlsx / .csv).'
+      });
       return;
     }
 
     await withQuotaLock(async () => {
-      const accounts = loadServerAccounts();
-      const classes = loadServerClasses();
+      const hydrated = await hydrateServerStateFromFirestore(true);
+      const accounts = hydrated.accounts;
+      const classes = hydrated.classes;
+      const joinRequests = hydrated.joinRequests;
       const existingSet = new Set(accounts.map((a) => a.username.toUpperCase()));
       const newAccounts: StoredUserAccount[] = [];
+      const failedRows: {
+        rowIndex: number;
+        fullName: string;
+        studentCode?: string;
+        reason: string;
+        code: string;
+      }[] = [];
       let skippedCount = 0;
       let quotaRejectedCount = 0;
 
-      for (const row of rows) {
-        const uname = String(row.username || '').trim().toUpperCase();
-        const cname = String(row.className || '12A1').trim().toUpperCase();
-        if (!uname || existingSet.has(uname)) {
+      // Cross-teacher check if defaultClassId was provided
+      if (defaultClassId) {
+        const checkCls = classes.find((c) => c.id === defaultClassId);
+        if (checkCls && checkCls.teacherUid !== session.uid && session.role !== 'admin') {
+          res.status(403).json({
+            error:
+              'Từ chối truy cập (403): Bạn không có quyền nhập danh sách học sinh vào lớp của giáo viên khác.'
+          });
+          return;
+        }
+      }
+
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i] || {};
+        const rowIndex = typeof row.rowIndex === 'number' ? row.rowIndex : i + 1;
+        const fullName = String(row.fullName || '').trim();
+        const rawCode = String(row.username || row.studentCode || '')
+          .trim()
+          .toUpperCase()
+          .replace(/\s+/g, '');
+        const cname = String(row.className || defaultClassName || '12A1')
+          .trim()
+          .toUpperCase();
+
+        if (!fullName) {
           skippedCount++;
+          failedRows.push({
+            rowIndex,
+            fullName: '',
+            studentCode: rawCode || undefined,
+            reason: `Dòng ${rowIndex}: Thiếu Họ và tên học sinh.`,
+            code: 'MISSING_NAME'
+          });
           continue;
         }
 
         let targetClass = classes.find(
-          (c) => c.teacherUid === session.uid && c.name.toUpperCase() === cname
+          (c) =>
+            (defaultClassId && c.id === defaultClassId) ||
+            (c.teacherUid === session.uid && c.name.toUpperCase() === cname)
         );
+
+        if (targetClass && targetClass.teacherUid !== session.uid && session.role !== 'admin') {
+          skippedCount++;
+          failedRows.push({
+            rowIndex,
+            fullName,
+            studentCode: rawCode || undefined,
+            reason: `Dòng ${rowIndex}: Lớp ${cname} thuộc quyền quản lí của giáo viên khác.`,
+            code: 'INVALID_CLASS'
+          });
+          continue;
+        }
 
         if (!targetClass) {
           const teacherActiveCount = classes.filter(
@@ -4904,12 +5792,23 @@ export function createApiApp(): express.Express {
           ).length;
           if (teacherActiveCount >= MAX_ACTIVE_CLASSES_PER_TEACHER) {
             quotaRejectedCount++;
+            failedRows.push({
+              rowIndex,
+              fullName,
+              studentCode: rawCode || undefined,
+              reason: `Dòng ${rowIndex} (${fullName}): Đã đạt giới hạn tối đa ${MAX_ACTIVE_CLASSES_PER_TEACHER} lớp đang hoạt động/giáo viên, không thể tự tạo thêm lớp ${cname}.`,
+              code: 'INVALID_CLASS'
+            });
             continue;
           }
           const now = new Date().toISOString();
           targetClass = {
             id: `cls-${crypto.randomUUID()}`,
             name: cname,
+            grade: inferGradeFromClassName(cname),
+            schoolYear: '2025-2026',
+            joinCode: generateUniqueClassJoinCode(classes, cname),
+            allowJoinByCode: true,
             teacherUid: session.uid,
             teacherName: authUser.fullName,
             status: 'active',
@@ -4921,24 +5820,63 @@ export function createApiApp(): express.Express {
           classes.push(targetClass);
         }
 
-        const currentClassCount =
-          accounts.filter(
-            (a) =>
-              a.role === 'student' &&
-              (a.classId === targetClass!.id ||
-                (a.teacherUid === session.uid && (a.className || '').toUpperCase() === cname))
-          ).length +
-          newAccounts.filter((a) => a.classId === targetClass!.id).length;
+        const preExistingInTargetClass = accounts.filter(
+          (a) =>
+            a.role === 'student' &&
+            (a.classId === targetClass!.id ||
+              (a.teacherUid === session.uid && (a.className || '').toUpperCase() === cname))
+        );
+        const enrolledInTargetClass = [
+          ...preExistingInTargetClass,
+          ...newAccounts.filter((a) => a.classId === targetClass!.id)
+        ];
 
-        if (currentClassCount >= MAX_ENROLLED_STUDENTS_PER_CLASS) {
-          quotaRejectedCount++;
+        // Check if student with same code is already in this class before this import
+        if (
+          rawCode &&
+          preExistingInTargetClass.some((a) => a.username.toUpperCase() === rawCode)
+        ) {
+          skippedCount++;
+          failedRows.push({
+            rowIndex,
+            fullName,
+            studentCode: rawCode,
+            reason: `Dòng ${rowIndex} (${fullName}): Học sinh với mã "${rawCode}" đã có trong lớp ${targetClass.name}.`,
+            code: 'ALREADY_IN_CLASS'
+          });
           continue;
         }
 
+        const genUser = generateUniqueStudentUsername(existingSet, targetClass.name, rawCode);
+        if (genUser.isDuplicatePreferred) {
+          skippedCount++;
+          failedRows.push({
+            rowIndex,
+            fullName,
+            studentCode: rawCode,
+            reason: `Dòng ${rowIndex} (${fullName}): Mã học sinh "${rawCode}" bị trùng trong hệ thống hoặc trùng trong tệp Excel.`,
+            code: 'DUPLICATE_CODE'
+          });
+          continue;
+        }
+
+        if (enrolledInTargetClass.length >= MAX_ENROLLED_STUDENTS_PER_CLASS) {
+          quotaRejectedCount++;
+          failedRows.push({
+            rowIndex,
+            fullName,
+            studentCode: genUser.username,
+            reason: `Dòng ${rowIndex} (${fullName}): Lớp ${targetClass.name} đã đủ tối đa ${MAX_ENROLLED_STUDENTS_PER_CLASS}/${MAX_ENROLLED_STUDENTS_PER_CLASS} học sinh.`,
+            code: 'CLASS_FULL'
+          });
+          continue;
+        }
+
+        const uname = genUser.username;
         const acc: StoredUserAccount = {
           id: `uid-hs-${crypto.randomUUID()}`,
           username: uname,
-          fullName: String(row.fullName || `Học sinh ${uname}`).trim(),
+          fullName,
           role: 'student',
           className: targetClass.name,
           classId: targetClass.id,
@@ -4954,34 +5892,62 @@ export function createApiApp(): express.Express {
 
         existingSet.add(uname);
         newAccounts.push(acc);
-        targetClass.enrolledCount = currentClassCount + 1;
+        targetClass.enrolledCount = enrolledInTargetClass.length + 1;
         targetClass.updatedAt = new Date().toISOString();
       }
 
       if (newAccounts.length === 0 && quotaRejectedCount > 0) {
         res.status(403).json({
-          error: `Không thể ghi danh: Đã vượt giới hạn tối đa (${MAX_ACTIVE_CLASSES_PER_TEACHER} lớp/giáo viên hoặc ${MAX_ENROLLED_STUDENTS_PER_CLASS} học sinh/lớp).`
+          error: `Không thể ghi danh: Đã vượt giới hạn tối đa (${MAX_ACTIVE_CLASSES_PER_TEACHER} lớp/giáo viên hoặc ${MAX_ENROLLED_STUDENTS_PER_CLASS} học sinh/lớp).`,
+          code: 'MAX_STUDENTS_QUOTA_EXCEEDED',
+          addedCount: 0,
+          skippedCount,
+          quotaRejectedCount,
+          failedRows
+        });
+        return;
+      }
+
+      if (newAccounts.length === 0 && failedRows.length > 0) {
+        res.status(400).json({
+          error: `Không có học sinh nào hợp lệ để lưu (${failedRows[0].reason})`,
+          addedCount: 0,
+          skippedCount,
+          quotaRejectedCount,
+          failedRows
         });
         return;
       }
 
       const merged = [...newAccounts, ...accounts];
-      saveServerAccounts(merged);
-      saveServerClasses(classes);
+      const persisted = await persistBatchStudentsToStores(newAccounts, merged, classes);
+      if (!persisted.saved) {
+        res.status(500).json({
+          error: persisted.error || 'Không thể lưu danh sách học sinh vào cơ sở dữ liệu.'
+        });
+        return;
+      }
 
       res.json({
+        success: true,
         addedCount: newAccounts.length,
         skippedCount,
         quotaRejectedCount,
-        newAccounts: newAccounts.map((a) => sanitizeAccountForClient(a, true))
+        newAccounts: newAccounts.map((a) => sanitizeAccountForClient(a, true)),
+        failedRows,
+        classes: classes
+          .filter((c) => c.teacherUid === session.uid)
+          .map((c) => enrichClassroomForClient(c, merged, joinRequests))
       });
     });
   });
 
-  app.post('/api/accounts/reset-code', requireTeacherAuth, (req, res) => {
+  app.post('/api/accounts/reset-code', requireTeacherAuth, async (req, res) => {
     const session = (req as any).authSession as SessionTokenPayload;
     const { studentId } = req.body || {};
-    const accounts = loadServerAccounts();
+    const hydrated = await hydrateServerStateFromFirestore(false);
+    const accounts = hydrated.accounts;
+    const classes = hydrated.classes;
     const user = accounts.find((a) => a.id === studentId && a.role === 'student');
     if (!user) {
       res.status(404).json({ error: 'Không tìm thấy học sinh.' });
@@ -5001,7 +5967,12 @@ export function createApiApp(): express.Express {
     user.activationCodeExpiresAt = expiresAt;
     user.status = 'pending_activation';
     user.isActivated = false;
-    saveServerAccounts(accounts);
+
+    const persisted = await persistStudentAccountToStores(user, accounts, undefined, classes);
+    if (!persisted.saved) {
+      res.status(500).json({ error: persisted.error || 'Không thể lưu mã kích hoạt mới.' });
+      return;
+    }
 
     res.json({
       success: true,
@@ -5011,10 +5982,12 @@ export function createApiApp(): express.Express {
     });
   });
 
-  app.post('/api/accounts/toggle-lock', requireTeacherAuth, (req, res) => {
+  app.post('/api/accounts/toggle-lock', requireTeacherAuth, async (req, res) => {
     const session = (req as any).authSession as SessionTokenPayload;
     const { studentId } = req.body || {};
-    const accounts = loadServerAccounts();
+    const hydrated = await hydrateServerStateFromFirestore(false);
+    const accounts = hydrated.accounts;
+    const classes = hydrated.classes;
     const user = accounts.find((a) => a.id === studentId && a.role === 'student');
     if (!user) {
       res.status(404).json({ error: 'Không tìm thấy học sinh.' });
@@ -5034,7 +6007,12 @@ export function createApiApp(): express.Express {
           ? 'active'
           : 'pending_activation'
         : 'locked';
-    saveServerAccounts(accounts);
+
+    const persisted = await persistStudentAccountToStores(user, accounts, undefined, classes);
+    if (!persisted.saved) {
+      res.status(500).json({ error: persisted.error || 'Không thể cập nhật trạng thái tài khoản.' });
+      return;
+    }
 
     res.json({ account: sanitizeAccountForClient(user, true) });
   });

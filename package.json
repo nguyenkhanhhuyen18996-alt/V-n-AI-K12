@@ -27,7 +27,8 @@
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "recharts": "^3.10.1",
-    "vite": "^8.3.5"
+    "vite": "^8.3.5",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@firebase/eslint-plugin-security-rules": "^0.0.2",

@@ -19,7 +19,9 @@ import {
   verifyTeacherGmailOtp,
   verifyTeacherPhoneOtp,
   fetchTeacherRegistrationStatus,
-  checkTeacherEmailConfigOnServer
+  checkTeacherEmailConfigOnServer,
+  submitClassJoinByCode,
+  fetchClassJoinRequestStatus
 } from '../services/accountService';
 import {
   auth,
@@ -93,12 +95,41 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [loginPassword, setLoginPassword] = useState('');
   const [showLoginPassword, setShowLoginPassword] = useState(false);
 
-  // Form kích hoạt tài khoản học sinh
+  // Form kích hoạt tài khoản học sinh & Tham gia lớp bằng mã
+  const [studentOnboardMode, setStudentOnboardMode] = useState<'activate_code' | 'join_by_code'>(
+    'activate_code'
+  );
   const [activateUsername, setActivateUsername] = useState('');
   const [activateCode, setActivateCode] = useState('');
   const [activatePassword, setActivatePassword] = useState('');
   const [activateConfirmPassword, setActivateConfirmPassword] = useState('');
   const [showActivatePassword, setShowActivatePassword] = useState(false);
+
+  // Tham gia lớp bằng mã lớp (Không cần Gmail)
+  const [joinClassCodeInput, setJoinClassCodeInput] = useState('');
+  const [joinStudentFullName, setJoinStudentFullName] = useState('');
+  const [joinStudentCodeOptional, setJoinStudentCodeOptional] = useState('');
+  const [joinRequestLookupId, setJoinRequestLookupId] = useState<string>(() => {
+    try {
+      return localStorage.getItem('vanai12_last_class_join_req_id') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [activeJoinRequestStatus, setActiveJoinRequestStatus] = useState<{
+    id: string;
+    className: string;
+    teacherName: string;
+    fullName: string;
+    requestedStudentCode?: string;
+    assignedUsername?: string;
+    activationCode?: string;
+    isActivated?: boolean;
+    status: 'pending_teacher_approval' | 'approved' | 'rejected';
+    rejectionReason?: string;
+    createdAt: string;
+    reviewedAt?: string;
+  } | null>(null);
 
   // Form đăng ký Giáo viên & Xác minh OTP (SĐT hoặc Gmail)
   const [teacherUsername, setTeacherUsername] = useState('');
@@ -291,6 +322,82 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       }
     } catch (err: any) {
       setErrorMessage(err.message || 'Lỗi xử lý kích hoạt tài khoản.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Xử lý Học sinh gửi yêu cầu tham gia lớp bằng Mã lớp (Không cần Gmail, chờ Giáo viên duyệt)
+  const handleJoinClassByCodeSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage(null);
+    setSuccessMessage(null);
+
+    if (!joinClassCodeInput.trim() || !joinStudentFullName.trim()) {
+      setErrorMessage('Vui lòng nhập Mã tham gia lớp và Họ và tên của bạn.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const res = await submitClassJoinByCode({
+        joinCode: joinClassCodeInput.trim().toUpperCase(),
+        fullName: joinStudentFullName.trim(),
+        studentCode: joinStudentCodeOptional.trim().toUpperCase() || undefined
+      });
+      if (res.success && res.joinRequest) {
+        try {
+          localStorage.setItem('vanai12_last_class_join_req_id', res.joinRequest.id);
+        } catch {
+          // ignore storage error
+        }
+        setJoinRequestLookupId(res.joinRequest.id);
+        setActiveJoinRequestStatus({
+          ...res.joinRequest,
+          status: (res.joinRequest.status as any) || 'pending_teacher_approval'
+        });
+        setSuccessMessage(res.message);
+      } else {
+        setErrorMessage(res.message || 'Không thể gửi yêu cầu tham gia lớp.');
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Lỗi khi gửi yêu cầu tham gia lớp.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleCheckJoinRequestStatus = async (explicitId?: string) => {
+    const targetId = (explicitId || joinRequestLookupId).trim();
+    if (!targetId) {
+      setErrorMessage('Vui lòng nhập mã yêu cầu tham gia lớp để kiểm tra.');
+      return;
+    }
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setIsLoading(true);
+    try {
+      const res = await fetchClassJoinRequestStatus(targetId);
+      if (res.found && res.joinRequest) {
+        setActiveJoinRequestStatus(res.joinRequest);
+        if (res.joinRequest.status === 'approved') {
+          setSuccessMessage(
+            `Giáo viên ${res.joinRequest.teacherName} đã duyệt bạn vào lớp ${res.joinRequest.className}! Mã học sinh: ${res.joinRequest.assignedUsername}.`
+          );
+        } else if (res.joinRequest.status === 'rejected') {
+          setErrorMessage(
+            res.joinRequest.rejectionReason || 'Yêu cầu tham gia lớp đã bị giáo viên từ chối.'
+          );
+        } else {
+          setSuccessMessage(
+            `Yêu cầu vào lớp ${res.joinRequest.className} đang chờ Giáo viên ${res.joinRequest.teacherName} phê duyệt.`
+          );
+        }
+      } else {
+        setErrorMessage(res.message || 'Không tìm thấy yêu cầu tham gia lớp.');
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Lỗi tra cứu trạng thái tham gia lớp.');
     } finally {
       setIsLoading(false);
     }
@@ -1009,89 +1116,270 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             </div>
           )}
 
-          {/* TAB 2: KÍCH HOẠT TÀI KHOẢN HỌC SINH */}
+          {/* TAB 2: KÍCH HOẠT TÀI KHOẢN HỌC SINH HOẶC THAM GIA LỚP BẰNG MÃ */}
           {activeTab === 'activate' && !currentUser && (
-            <form onSubmit={handleActivate} className="space-y-4">
-              <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200 text-xs text-emerald-900 space-y-1">
-                <div className="font-bold flex items-center gap-1.5">
-                  <ShieldCheck className="w-4 h-4 text-emerald-700" />
-                  <span>Kích hoạt tài khoản học sinh mới:</span>
-                </div>
-                <p className="text-[11px] leading-relaxed text-emerald-800">
-                  Nhập Mã học sinh và Mã 6 chữ số dùng một lần do giáo viên cấp trong lớp của bạn.
-                </p>
+            <div className="space-y-4">
+              {/* Chuyển đổi giữa 2 chế độ: Đã có mã kích hoạt 6 số vs. Tham gia lớp bằng mã lớp */}
+              <div className="grid grid-cols-2 gap-1.5 p-1 bg-stone-100 rounded-xl border border-stone-200 text-xs">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStudentOnboardMode('activate_code');
+                    setErrorMessage(null);
+                    setSuccessMessage(null);
+                  }}
+                  className={`py-2 px-2.5 rounded-lg font-bold transition-colors cursor-pointer ${
+                    studentOnboardMode === 'activate_code'
+                      ? 'bg-emerald-700 text-white shadow-2xs'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
+                >
+                  1. Kích hoạt bằng Mã 6 số
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStudentOnboardMode('join_by_code');
+                    setErrorMessage(null);
+                    setSuccessMessage(null);
+                  }}
+                  className={`py-2 px-2.5 rounded-lg font-bold transition-colors cursor-pointer ${
+                    studentOnboardMode === 'join_by_code'
+                      ? 'bg-[#0F172A] text-white shadow-2xs'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
+                >
+                  2. Tham gia lớp bằng Mã lớp
+                </button>
               </div>
 
-              <div>
-                <label className="block text-xs font-bold text-stone-700 mb-1">
-                  Mã học sinh được cấp
-                </label>
-                <input
-                  type="text"
-                  value={activateUsername}
-                  onChange={(e) => setActivateUsername(e.target.value)}
-                  placeholder="Nhập mã học sinh do giáo viên cấp"
-                  className="w-full px-3 py-2 text-xs bg-stone-50 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600 uppercase font-mono"
-                />
-              </div>
+              {studentOnboardMode === 'activate_code' ? (
+                <form onSubmit={handleActivate} className="space-y-4">
+                  <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200 text-xs text-emerald-900 space-y-1">
+                    <div className="font-bold flex items-center gap-1.5">
+                      <ShieldCheck className="w-4 h-4 text-emerald-700" />
+                      <span>Đăng nhập lần đầu & Đặt mật khẩu riêng của Học sinh:</span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-emerald-800">
+                      Nhập <strong>Mã học sinh</strong> và <strong>Mã kích hoạt 6 chữ số dùng một lần</strong> trên Phiếu tài khoản do giáo viên phát. Không cần Gmail. Giáo viên sẽ không biết mật khẩu bạn tự đặt.
+                    </p>
+                  </div>
 
-              <div>
-                <label className="block text-xs font-bold text-stone-700 mb-1">
-                  Mã kích hoạt 6 chữ số (Dùng 1 lần)
-                </label>
-                <input
-                  type="text"
-                  maxLength={6}
-                  value={activateCode}
-                  onChange={(e) => setActivateCode(e.target.value.replace(/\D/g, ''))}
-                  placeholder="Nhập 6 chữ số"
-                  className="w-full px-3 py-2 text-sm bg-stone-50 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600 font-mono tracking-widest font-bold"
-                />
-              </div>
+                  <div>
+                    <label className="block text-xs font-bold text-stone-700 mb-1">
+                      Mã học sinh được cấp
+                    </label>
+                    <input
+                      type="text"
+                      value={activateUsername}
+                      onChange={(e) => setActivateUsername(e.target.value)}
+                      placeholder="VD: 12A1-HS01 hoặc 12A1-01"
+                      className="w-full px-3 py-2 text-xs bg-stone-50 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600 uppercase font-mono"
+                    />
+                  </div>
 
-              <div>
-                <label className="block text-xs font-bold text-stone-700 mb-1">
-                  Tự đặt mật khẩu mới (Tối thiểu 6 ký tự)
-                </label>
-                <div className="relative">
-                  <input
-                    type={showActivatePassword ? 'text' : 'password'}
-                    value={activatePassword}
-                    onChange={(e) => setActivatePassword(e.target.value)}
-                    placeholder="Nhập mật khẩu cá nhân của bạn"
-                    className="w-full px-3 py-2 pr-9 text-xs bg-stone-50 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600"
-                  />
+                  <div>
+                    <label className="block text-xs font-bold text-stone-700 mb-1">
+                      Mã kích hoạt 6 chữ số (Dùng 1 lần)
+                    </label>
+                    <input
+                      type="text"
+                      maxLength={6}
+                      value={activateCode}
+                      onChange={(e) => setActivateCode(e.target.value.replace(/\D/g, ''))}
+                      placeholder="Nhập 6 chữ số"
+                      className="w-full px-3 py-2 text-sm bg-stone-50 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600 font-mono tracking-widest font-bold"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-stone-700 mb-1">
+                      Tự đặt mật khẩu mới (Tối thiểu 6 ký tự)
+                    </label>
+                    <div className="relative">
+                      <input
+                        type={showActivatePassword ? 'text' : 'password'}
+                        value={activatePassword}
+                        onChange={(e) => setActivatePassword(e.target.value)}
+                        placeholder="Nhập mật khẩu cá nhân của bạn"
+                        className="w-full px-3 py-2 pr-9 text-xs bg-stone-50 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowActivatePassword(!showActivatePassword)}
+                        className="absolute right-3 top-2.5 text-stone-400 hover:text-stone-600 cursor-pointer"
+                      >
+                        {showActivatePassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-stone-700 mb-1">
+                      Xác nhận lại mật khẩu
+                    </label>
+                    <input
+                      type="password"
+                      value={activateConfirmPassword}
+                      onChange={(e) => setActivateConfirmPassword(e.target.value)}
+                      placeholder="Nhập lại mật khẩu vừa đặt"
+                      className="w-full px-3 py-2 text-xs bg-stone-50 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600"
+                    />
+                  </div>
+
                   <button
-                    type="button"
-                    onClick={() => setShowActivatePassword(!showActivatePassword)}
-                    className="absolute right-3 top-2.5 text-stone-400 hover:text-stone-600 cursor-pointer"
+                    type="submit"
+                    disabled={isLoading}
+                    className="w-full py-2.5 px-4 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center justify-center gap-2 shadow-xs disabled:opacity-50"
                   >
-                    {showActivatePassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    {isLoading ? 'Đang kích hoạt trên máy chủ...' : 'Kích hoạt tài khoản & Bắt đầu học'}
                   </button>
+                </form>
+              ) : (
+                <div className="space-y-4">
+                  <div className="p-3 bg-blue-50 rounded-xl border border-blue-200 text-xs text-blue-950 space-y-1">
+                    <div className="font-bold flex items-center gap-1.5">
+                      <GraduationCap className="w-4 h-4 text-blue-700" />
+                      <span>Tham gia lớp bằng Mã lớp (Cần Giáo viên duyệt):</span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-blue-900">
+                      Nhập Mã tham gia lớp do Giáo viên cung cấp và Họ tên của em (không cần Gmail). Sau khi Giáo viên duyệt, em sẽ nhận được <strong>Mã học sinh</strong> và <strong>Mã kích hoạt 6 số</strong> ngay tại đây.
+                    </p>
+                  </div>
+
+                  <form onSubmit={handleJoinClassByCodeSubmit} className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-bold text-stone-700 mb-1">
+                        Mã tham gia lớp (Do Giáo viên cung cấp) *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={joinClassCodeInput}
+                        onChange={(e) => setJoinClassCodeInput(e.target.value.toUpperCase())}
+                        placeholder="VD: VA-8K9M2P"
+                        className="w-full px-3 py-2 text-sm bg-stone-50 border border-stone-300 rounded-lg uppercase font-mono font-bold tracking-wider focus:outline-none focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-stone-700 mb-1">
+                        Họ và tên học sinh *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={joinStudentFullName}
+                        onChange={(e) => setJoinStudentFullName(e.target.value)}
+                        placeholder="VD: Nguyễn Văn An"
+                        className="w-full px-3 py-2 text-xs bg-stone-50 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-stone-700 mb-1">
+                        Mã học sinh trên lớp (Tùy chọn — Bỏ trống giáo viên sẽ cấp mã)
+                      </label>
+                      <input
+                        type="text"
+                        value={joinStudentCodeOptional}
+                        onChange={(e) => setJoinStudentCodeOptional(e.target.value.toUpperCase())}
+                        placeholder="Bỏ trống nếu chưa có mã"
+                        className="w-full px-3 py-2 text-xs bg-stone-50 border border-stone-300 rounded-lg uppercase font-mono focus:outline-none focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={isLoading}
+                      className="w-full py-2.5 px-4 bg-[#0F172A] hover:bg-stone-800 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center justify-center gap-2 shadow-xs disabled:opacity-50"
+                    >
+                      {isLoading ? 'Đang gửi yêu cầu...' : 'Gửi yêu cầu tham gia lớp'}
+                    </button>
+                  </form>
+
+                  {/* Hộp kiểm tra trạng thái Giáo viên phê duyệt yêu cầu tham gia lớp */}
+                  <div className="p-3.5 bg-stone-50 border border-stone-200 rounded-xl space-y-2.5 text-xs">
+                    <div className="font-bold text-stone-800">
+                      Kiểm tra trạng thái Giáo viên duyệt & Nhận mã kích hoạt:
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={joinRequestLookupId}
+                        onChange={(e) => setJoinRequestLookupId(e.target.value)}
+                        placeholder="Mã yêu cầu (VD: jreq-...)"
+                        className="flex-1 px-2.5 py-1.5 bg-white border border-stone-300 rounded-lg font-mono text-xs"
+                      />
+                      <button
+                        type="button"
+                        disabled={isLoading || !joinRequestLookupId.trim()}
+                        onClick={() => handleCheckJoinRequestStatus()}
+                        className="px-3 py-1.5 bg-blue-700 hover:bg-blue-800 text-white rounded-lg font-bold text-xs cursor-pointer disabled:opacity-50"
+                      >
+                        Kiểm tra
+                      </button>
+                    </div>
+
+                    {activeJoinRequestStatus && (
+                      <div className="p-3 bg-white border border-stone-200 rounded-lg space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-stone-900">
+                            {activeJoinRequestStatus.fullName} — Lớp {activeJoinRequestStatus.className}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                              activeJoinRequestStatus.status === 'approved'
+                                ? 'bg-emerald-100 text-emerald-900'
+                                : activeJoinRequestStatus.status === 'rejected'
+                                ? 'bg-rose-100 text-rose-900'
+                                : 'bg-amber-100 text-amber-900'
+                            }`}
+                          >
+                            {activeJoinRequestStatus.status === 'approved'
+                              ? 'Đã được GV duyệt'
+                              : activeJoinRequestStatus.status === 'rejected'
+                              ? 'Đã từ chối'
+                              : 'Chờ GV duyệt'}
+                          </span>
+                        </div>
+
+                        {activeJoinRequestStatus.status === 'approved' &&
+                          activeJoinRequestStatus.assignedUsername && (
+                            <div className="p-2.5 bg-emerald-50 border border-emerald-300 rounded-lg space-y-2">
+                              <div className="text-[11px] text-emerald-950">
+                                • Mã học sinh của em:{' '}
+                                <strong className="font-mono">
+                                  {activeJoinRequestStatus.assignedUsername}
+                                </strong>
+                                <br />• Mã kích hoạt 1 lần (6 số):{' '}
+                                <strong className="font-mono">
+                                  {activeJoinRequestStatus.activationCode || 'Đã kích hoạt'}
+                                </strong>
+                              </div>
+                              {activeJoinRequestStatus.activationCode && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setActivateUsername(
+                                      activeJoinRequestStatus.assignedUsername || ''
+                                    );
+                                    setActivateCode(activeJoinRequestStatus.activationCode || '');
+                                    setStudentOnboardMode('activate_code');
+                                  }}
+                                  className="w-full py-1.5 px-3 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg font-bold text-[11px] cursor-pointer"
+                                >
+                                  Chuyển sang đặt mật khẩu & Kích hoạt ngay →
+                                </button>
+                              )}
+                            </div>
+                          )}
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-stone-700 mb-1">
-                  Xác nhận lại mật khẩu
-                </label>
-                <input
-                  type="password"
-                  value={activateConfirmPassword}
-                  onChange={(e) => setActivateConfirmPassword(e.target.value)}
-                  placeholder="Nhập lại mật khẩu vừa đặt"
-                  className="w-full px-3 py-2 text-xs bg-stone-50 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600"
-                />
-              </div>
-
-              <button
-                type="submit"
-                disabled={isLoading}
-                className="w-full py-2.5 px-4 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer flex items-center justify-center gap-2 shadow-xs disabled:opacity-50"
-              >
-                {isLoading ? 'Đang kích hoạt...' : 'Kích hoạt tài khoản & Bắt đầu học'}
-              </button>
-            </form>
+              )}
+            </div>
           )}
 
           {/* TAB 3: ĐĂNG KÝ GIÁO VIÊN & XÁC MINH OTP SĐT / GMAIL */}

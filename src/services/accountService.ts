@@ -1,3 +1,4 @@
+import * as XLSX from 'xlsx';
 import {
   UserAccount,
   StudentSurveyData,
@@ -6,6 +7,8 @@ import {
   TeacherRegistrationRecord,
   TeacherVerificationMethod,
   ClassroomRecord,
+  ClassJoinRequestRecord,
+  BatchImportRowError,
   AdminOverviewData
 } from '../types';
 
@@ -745,7 +748,15 @@ export async function fetchTeacherClasses(): Promise<{
   };
 }
 
-export async function createTeacherClassroom(name: string): Promise<{
+export async function createTeacherClassroom(
+  name: string,
+  options?: {
+    grade?: string;
+    schoolYear?: string;
+    description?: string;
+    allowJoinByCode?: boolean;
+  }
+): Promise<{
   success: boolean;
   classroom?: ClassroomRecord;
   quota?: {
@@ -761,7 +772,13 @@ export async function createTeacherClassroom(name: string): Promise<{
   const result = await safeFetchJson<any>('/api/classes', {
     method: 'POST',
     headers: getAuthHeaders(),
-    body: JSON.stringify({ name })
+    body: JSON.stringify({
+      name,
+      grade: options?.grade,
+      schoolYear: options?.schoolYear,
+      description: options?.description,
+      allowJoinByCode: options?.allowJoinByCode
+    })
   });
   if (!result.isJson || !result.data) {
     return {
@@ -784,6 +801,175 @@ export async function createTeacherClassroom(name: string): Promise<{
     classroom: data.classroom,
     quota: data.quota,
     message: data.message || `Đã tạo lớp ${name} thành công!`
+  };
+}
+
+export async function manageClassroomJoinCode(
+  classId: string,
+  action: 'toggle' | 'regenerate' | 'revoke',
+  allowJoinByCode?: boolean
+): Promise<{
+  success: boolean;
+  classroom?: ClassroomRecord;
+  message: string;
+}> {
+  if (!isVerifiedTeacherSession()) {
+    throw new Error('Từ chối truy cập: Chỉ Giáo viên đã đăng nhập mới được quản lý mã tham gia lớp.');
+  }
+  const result = await safeFetchJson<any>(`/api/classes/${encodeURIComponent(classId)}/join-code`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ action, allowJoinByCode })
+  });
+  if (!result.isJson || !result.data) {
+    return {
+      success: false,
+      message: result.errorMessage || `Lỗi kết nối máy chủ khi cập nhật mã lớp (HTTP ${result.status}).`
+    };
+  }
+  return {
+    success: Boolean(result.ok && result.data.success),
+    classroom: result.data.classroom,
+    message:
+      result.data.message ||
+      result.data.error ||
+      result.errorMessage ||
+      'Không thể cập nhật mã tham gia lớp.'
+  };
+}
+
+export async function submitClassJoinByCode(payload: {
+  joinCode: string;
+  fullName: string;
+  studentCode?: string;
+  notes?: string;
+}): Promise<{
+  success: boolean;
+  alreadyPending?: boolean;
+  joinRequest?: {
+    id: string;
+    className: string;
+    teacherName: string;
+    fullName: string;
+    requestedStudentCode?: string;
+    status: string;
+    createdAt: string;
+  };
+  message: string;
+}> {
+  const result = await safeFetchJson<any>('/api/classes/join-by-code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!result.isJson || !result.data) {
+    return {
+      success: false,
+      message: result.errorMessage || `Lỗi kết nối khi gửi yêu cầu tham gia lớp (HTTP ${result.status}).`
+    };
+  }
+  return {
+    success: Boolean(result.ok && result.data.success),
+    alreadyPending: result.data.alreadyPending,
+    joinRequest: result.data.joinRequest,
+    message:
+      result.data.message ||
+      result.data.error ||
+      result.errorMessage ||
+      'Không thể gửi yêu cầu tham gia lớp.'
+  };
+}
+
+export async function fetchClassJoinRequestStatus(requestId: string): Promise<{
+  found: boolean;
+  joinRequest?: {
+    id: string;
+    className: string;
+    teacherName: string;
+    fullName: string;
+    requestedStudentCode?: string;
+    assignedUsername?: string;
+    activationCode?: string;
+    isActivated?: boolean;
+    status: 'pending_teacher_approval' | 'approved' | 'rejected';
+    rejectionReason?: string;
+    createdAt: string;
+    reviewedAt?: string;
+  };
+  message?: string;
+}> {
+  const result = await safeFetchJson<any>(
+    `/api/classes/join-request-status/${encodeURIComponent(requestId.trim())}`
+  );
+  if (!result.isJson || !result.data) {
+    return {
+      found: false,
+      message: result.errorMessage || `Không thể tra cứu trạng thái tham gia lớp (HTTP ${result.status}).`
+    };
+  }
+  return {
+    found: Boolean(result.ok && result.data.found),
+    joinRequest: result.data.joinRequest,
+    message: result.data.message || result.errorMessage
+  };
+}
+
+export async function fetchTeacherClassJoinRequests(className?: string): Promise<ClassJoinRequestRecord[]> {
+  if (!isVerifiedTeacherSession()) return [];
+  const query = className && className !== 'all' ? `?className=${encodeURIComponent(className)}` : '';
+  const result = await safeFetchJson<any>(`/api/classes/join-requests${query}`, {
+    headers: getAuthHeaders()
+  });
+  if (result.ok && result.isJson && Array.isArray(result.data?.joinRequests)) {
+    return result.data.joinRequests as ClassJoinRequestRecord[];
+  }
+  return [];
+}
+
+export async function reviewClassJoinRequest(
+  requestId: string,
+  payload: {
+    action: 'approve' | 'reject';
+    studentCode?: string;
+    reason?: string;
+  }
+): Promise<{
+  success: boolean;
+  joinRequest?: ClassJoinRequestRecord;
+  account?: UserAccount;
+  classroom?: ClassroomRecord;
+  message: string;
+}> {
+  if (!isVerifiedTeacherSession()) {
+    throw new Error('Từ chối truy cập: Chỉ Giáo viên phụ trách lớp mới được duyệt yêu cầu tham gia.');
+  }
+  const result = await safeFetchJson<any>(
+    `/api/classes/join-requests/${encodeURIComponent(requestId)}/review`,
+    {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(payload)
+    }
+  );
+  if (!result.isJson || !result.data) {
+    return {
+      success: false,
+      message: result.errorMessage || `Lỗi kết nối khi xét duyệt yêu cầu tham gia lớp (HTTP ${result.status}).`
+    };
+  }
+  if (result.ok && result.data.success) {
+    await initializeAccounts();
+  }
+  return {
+    success: Boolean(result.ok && result.data.success),
+    joinRequest: result.data.joinRequest,
+    account: result.data.account,
+    classroom: result.data.classroom,
+    message:
+      result.data.message ||
+      result.data.error ||
+      result.errorMessage ||
+      'Không thể xử lý yêu cầu tham gia lớp.'
   };
 }
 
@@ -1042,7 +1228,7 @@ export async function toggleAccountLock(studentId: string): Promise<UserAccount 
  * Giáo viên thêm học sinh mới vào danh sách lớp (/api/accounts/student)
  */
 export async function addNewStudent(payload: {
-  username: string;
+  username?: string;
   fullName: string;
   className: string;
   email?: string;
@@ -1068,8 +1254,22 @@ export async function addNewStudent(payload: {
  * Giáo viên nhập danh sách học sinh hàng loạt (/api/accounts/batch)
  */
 export async function importBatchStudents(
-  rows: { username: string; fullName: string; className: string; email?: string; notes?: string }[]
-): Promise<{ addedCount: number; skippedCount: number; newAccounts: UserAccount[] }> {
+  rows: {
+    rowNumber?: number;
+    username?: string;
+    fullName: string;
+    className: string;
+    email?: string;
+    notes?: string;
+  }[]
+): Promise<{
+  addedCount: number;
+  skippedCount: number;
+  quotaRejectedCount: number;
+  newAccounts: UserAccount[];
+  failedRows: BatchImportRowError[];
+  classes?: ClassroomRecord[];
+}> {
   if (!isVerifiedTeacherSession()) {
     throw new Error('Từ chối truy cập: Chỉ Giáo viên đã đăng nhập mới có quyền nhập danh sách lớp.');
   }
@@ -1086,8 +1286,276 @@ export async function importBatchStudents(
   return {
     addedCount: data.addedCount || 0,
     skippedCount: data.skippedCount || 0,
-    newAccounts: data.newAccounts || []
+    quotaRejectedCount: data.quotaRejectedCount || 0,
+    newAccounts: data.newAccounts || [],
+    failedRows: Array.isArray(data.failedRows) ? data.failedRows : [],
+    classes: data.classes
   };
+}
+
+// ============================================================================
+// TIỆN ÍCH TẢI MẪU EXCEL (.XLSX / .CSV), ĐỌC FILE EXCEL & XUẤT PHIẾU KÍCH HOẠT
+// ============================================================================
+export function downloadStudentImportTemplateXlsx(defaultClassName = '12A1'): void {
+  const cleanClass = (defaultClassName && defaultClassName !== 'all' ? defaultClassName : '12A1').toUpperCase();
+  const sampleRows = [
+    {
+      'STT': 1,
+      'Họ và tên': 'Nguyễn Văn An',
+      'Mã học sinh (Tùy chọn)': `${cleanClass}-HS01`,
+      'Lớp': cleanClass,
+      'Ghi chú (Tùy chọn)': 'Học sinh tiêu biểu'
+    },
+    {
+      'STT': 2,
+      'Họ và tên': 'Trần Thị Bích Ngọc',
+      'Mã học sinh (Tùy chọn)': '',
+      'Lớp': cleanClass,
+      'Ghi chú (Tùy chọn)': 'Để trống Mã HS hệ thống sẽ tự sinh mã không trùng'
+    },
+    {
+      'STT': 3,
+      'Họ và tên': 'Lê Hoàng Nam',
+      'Mã học sinh (Tùy chọn)': `${cleanClass}-HS03`,
+      'Lớp': cleanClass,
+      'Ghi chú (Tùy chọn)': ''
+    }
+  ];
+
+  const ws = XLSX.utils.json_to_sheet(sampleRows);
+  ws['!cols'] = [
+    { wch: 6 },
+    { wch: 28 },
+    { wch: 24 },
+    { wch: 12 },
+    { wch: 38 }
+  ];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, `DanhSach_${cleanClass}`);
+  XLSX.writeFile(wb, `Mau_Danh_Sach_Hoc_Sinh_${cleanClass}_VanAI12.xlsx`);
+}
+
+export function downloadStudentImportTemplateCsv(defaultClassName = '12A1'): void {
+  const cleanClass = (defaultClassName && defaultClassName !== 'all' ? defaultClassName : '12A1').toUpperCase();
+  const csvContent =
+    '\uFEFFSTT,Họ và tên,Mã học sinh (Tùy chọn),Lớp,Ghi chú (Tùy chọn)\n' +
+    `1,Nguyễn Văn An,${cleanClass}-HS01,${cleanClass},Học sinh mẫu 1\n` +
+    `2,Trần Thị Bích Ngọc,,${cleanClass},Để trống Mã HS hệ thống tự tạo\n` +
+    `3,Lê Hoàng Nam,${cleanClass}-HS03,${cleanClass},\n`;
+
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `Mau_Danh_Sach_Hoc_Sinh_${cleanClass}_VanAI12.csv`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+export function exportStudentCredentialsXlsx(students: UserAccount[], classLabel = 'TatCa'): void {
+  const rows = students.map((acc, idx) => ({
+    'STT': idx + 1,
+    'Lớp': acc.className,
+    'Họ và tên học sinh': acc.fullName,
+    'Mã đăng nhập (Mã học sinh)': acc.username,
+    'Mã kích hoạt 6 số (Dùng 1 lần)': acc.isActivated
+      ? 'Đã kích hoạt (HS tự quản mật khẩu)'
+      : acc.activationCode || 'Cần cấp lại mã',
+    'Trạng thái tài khoản': acc.isActivated ? 'Đã kích hoạt' : 'Chờ học sinh kích hoạt',
+    'Hướng dẫn đăng nhập lần đầu':
+      'Bấm Đăng nhập -> Chọn tab Kích hoạt HS -> Nhập Mã học sinh + Mã kích hoạt 6 số -> Tự đặt mật khẩu riêng'
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = [
+    { wch: 6 },
+    { wch: 10 },
+    { wch: 28 },
+    { wch: 24 },
+    { wch: 30 },
+    { wch: 22 },
+    { wch: 60 }
+  ];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'PhieuTaiKhoan');
+  XLSX.writeFile(wb, `Phieu_Tai_Khoan_Hoc_Sinh_${classLabel}_VanAI12.xlsx`);
+}
+
+export async function parseStudentRosterExcelOrCsvFile(
+  file: File,
+  defaultClassName: string
+): Promise<{
+  rows: {
+    rowNumber: number;
+    fullName: string;
+    studentCode: string;
+    className: string;
+    notes?: string;
+  }[];
+  error?: string;
+}> {
+  const fileName = (file.name || '').toLowerCase();
+  if (!fileName.endsWith('.xlsx') && !fileName.endsWith('.csv') && !fileName.endsWith('.xls')) {
+    return {
+      rows: [],
+      error: 'Định dạng tệp không hợp lệ. Hệ thống chỉ hỗ trợ tệp Excel (.xlsx) hoặc CSV (.csv).'
+    };
+  }
+  if (file.size === 0) {
+    return {
+      rows: [],
+      error: 'Tệp tải lên đang rỗng (0 byte). Vui lòng chọn tệp có dữ liệu học sinh.'
+    };
+  }
+
+  try {
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: 'array' });
+    if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
+      return {
+        rows: [],
+        error: 'Không tìm thấy trang tính (sheet) nào trong tệp Excel.'
+      };
+    }
+    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rawGrid = XLSX.utils.sheet_to_json<any[]>(firstSheet, {
+      header: 1,
+      defval: '',
+      blankrows: false
+    });
+
+    if (!Array.isArray(rawGrid) || rawGrid.length === 0) {
+      return {
+        rows: [],
+        error: 'Tệp danh sách trống, không có dòng dữ liệu nào.'
+      };
+    }
+
+    const normalizeHeader = (val: any) =>
+      String(val || '')
+        .trim()
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
+
+    const firstRow = (rawGrid[0] || []).map(normalizeHeader);
+    let nameColIdx = -1;
+    let codeColIdx = -1;
+    let classColIdx = -1;
+    let notesColIdx = -1;
+    let hasHeader = false;
+
+    firstRow.forEach((cell, idx) => {
+      if (
+        cell.includes('ho va ten') ||
+        cell.includes('ho ten') ||
+        cell === 'ten' ||
+        cell.includes('ten hoc sinh') ||
+        cell.includes('fullname') ||
+        cell.includes('name')
+      ) {
+        nameColIdx = idx;
+        hasHeader = true;
+      } else if (
+        cell.includes('ma hoc sinh') ||
+        cell.includes('ma hs') ||
+        cell.includes('ma so') ||
+        cell.includes('student code') ||
+        cell.includes('username') ||
+        cell === 'mhs'
+      ) {
+        codeColIdx = idx;
+        hasHeader = true;
+      } else if (cell === 'lop' || cell.includes('ten lop') || cell.includes('class')) {
+        classColIdx = idx;
+        hasHeader = true;
+      } else if (cell.includes('ghi chu') || cell.includes('note')) {
+        notesColIdx = idx;
+        hasHeader = true;
+      }
+    });
+
+    const startRowIdx = hasHeader ? 1 : 0;
+    const parsedRows: {
+      rowNumber: number;
+      fullName: string;
+      studentCode: string;
+      className: string;
+      notes?: string;
+    }[] = [];
+
+    for (let r = startRowIdx; r < rawGrid.length; r++) {
+      const rowCells = (rawGrid[r] || []).map((c: any) => String(c ?? '').trim());
+      if (rowCells.every((c) => !c)) continue;
+
+      let fullName = '';
+      let studentCode = '';
+      let className = defaultClassName;
+      let notes = '';
+
+      if (hasHeader && nameColIdx >= 0) {
+        fullName = rowCells[nameColIdx] || '';
+        studentCode = codeColIdx >= 0 ? rowCells[codeColIdx] || '' : '';
+        if (classColIdx >= 0 && rowCells[classColIdx]) {
+          className = rowCells[classColIdx];
+        }
+        if (notesColIdx >= 0 && rowCells[notesColIdx]) {
+          notes = rowCells[notesColIdx];
+        }
+      } else {
+        // Nếu không có dòng tiêu đề chuẩn: Tự nhận diện cột STT, Mã HS và Họ tên
+        const nonEmpty = rowCells.filter(Boolean);
+        if (nonEmpty.length === 1) {
+          fullName = nonEmpty[0];
+        } else if (/^\d+$/.test(rowCells[0])) {
+          // Cột 0 là STT
+          if (rowCells.length >= 3 && /^[A-Za-z0-9_-]{3,20}$/.test(rowCells[2]) && rowCells[1].includes(' ')) {
+            fullName = rowCells[1];
+            studentCode = rowCells[2];
+            if (rowCells[3]) className = rowCells[3];
+          } else if (rowCells.length >= 3 && /^[A-Za-z0-9_-]{3,20}$/.test(rowCells[1]) && !rowCells[1].includes(' ')) {
+            studentCode = rowCells[1];
+            fullName = rowCells[2];
+            if (rowCells[3]) className = rowCells[3];
+          } else {
+            fullName = rowCells[1] || '';
+            studentCode = rowCells[2] || '';
+          }
+        } else if (/^[A-Za-z0-9_-]{3,20}$/.test(rowCells[0]) && !rowCells[0].includes(' ') && rowCells[1]) {
+          studentCode = rowCells[0];
+          fullName = rowCells[1];
+          if (rowCells[2]) className = rowCells[2];
+        } else {
+          fullName = rowCells[0] || '';
+          studentCode = rowCells[1] || '';
+          if (rowCells[2]) className = rowCells[2];
+        }
+      }
+
+      parsedRows.push({
+        rowNumber: r + 1,
+        fullName: fullName.trim(),
+        studentCode: studentCode.trim().toUpperCase(),
+        className: (className || defaultClassName || '12A1').trim().toUpperCase(),
+        notes: notes.trim() || undefined
+      });
+    }
+
+    if (parsedRows.length === 0) {
+      return {
+        rows: [],
+        error: 'Tệp không có dòng dữ liệu học sinh nào sau tiêu đề.'
+      };
+    }
+
+    return { rows: parsedRows };
+  } catch (err: any) {
+    return {
+      rows: [],
+      error: `Không thể đọc tệp Excel/CSV (${err?.message || 'Tệp bị hỏng hoặc sai định dạng'}).`
+    };
+  }
 }
 
 /**

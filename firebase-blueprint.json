@@ -406,6 +406,11 @@
       "properties": {
         "id": { "type": "string", "minLength": 1, "maxLength": 128 },
         "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "grade": { "type": "string", "maxLength": 16 },
+        "schoolYear": { "type": "string", "maxLength": 32 },
+        "description": { "type": "string", "maxLength": 500 },
+        "joinCode": { "type": "string", "maxLength": 32 },
+        "allowJoinByCode": { "type": "boolean" },
         "teacherUid": { "type": "string", "minLength": 1, "maxLength": 128 },
         "teacherName": { "type": "string", "minLength": 1, "maxLength": 120 },
         "status": { "type": "string", "enum": ["active", "archived"] },
@@ -415,6 +420,32 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "name", "teacherUid", "teacherName", "status", "enrolledCount", "maxCapacity", "createdAt", "updatedAt"]
+    },
+    "ClassJoinRequestDocument": {
+      "title": "ClassJoinRequestDocument",
+      "description": "Student request to join a classroom using its joinCode, requiring teacher approval.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "classId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "className": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "grade": { "type": "string", "maxLength": 16 },
+        "schoolYear": { "type": "string", "maxLength": 32 },
+        "teacherUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "teacherName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "fullName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "studentCode": { "type": "string", "maxLength": 64 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "createdStudentUid": { "type": "string", "maxLength": 128 },
+        "createdStudentUsername": { "type": "string", "maxLength": 64 },
+        "createdActivationCode": { "type": "string", "maxLength": 16 },
+        "activationCodeExpiresAt": { "type": "string", "maxLength": 64 },
+        "rejectionReason": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "reviewedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "classId", "className", "teacherUid", "teacherName", "fullName", "status", "createdAt"]
     },
     "TeacherRegistrationDocument": {
       "title": "TeacherRegistrationDocument",
@@ -473,6 +504,10 @@
     "/classes/{classId}": {
       "schema": { "$ref": "#/entities/ClassroomDocument" },
       "description": "Teacher classrooms with server-enforced quota (max 5 active per teacher, max 50 students per class)."
+    },
+    "/class_join_requests/{requestId}": {
+      "schema": { "$ref": "#/entities/ClassJoinRequestDocument" },
+      "description": "Student requests to join a classroom by joinCode awaiting teacher approval."
     },
     "/teacher_registrations/{registrationId}": {
       "schema": { "$ref": "#/entities/TeacherRegistrationDocument" },

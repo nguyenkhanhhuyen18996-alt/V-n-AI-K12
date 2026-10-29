@@ -477,6 +477,12 @@ export const MAX_ENROLLED_STUDENTS_PER_CLASS = 50;
 export interface ClassroomRecord {
   id: string;
   name: string; // VD: "12A1"
+  grade?: string; // Khối: "10" | "11" | "12"
+  schoolYear?: string; // Năm học: "2025-2026"
+  description?: string; // Ghi chú / mô tả lớp học
+  joinCode?: string; // Mã tham gia lớp riêng (VD: "V12-8K4M")
+  allowJoinByCode?: boolean; // Giáo viên có thể bật/tắt tham gia lớp bằng mã bất cứ lúc nào
+  pendingJoinCount?: number; // Số yêu cầu tham gia lớp đang chờ giáo viên duyệt
   teacherUid: string; // UID giáo viên sở hữu lớp
   teacherName: string;
   status: 'active' | 'archived';
@@ -486,6 +492,62 @@ export interface ClassroomRecord {
   createdAt: string;
   updatedAt: string;
 }
+
+export interface ClassJoinRequestRecord {
+  id: string;
+  classId: string;
+  className: string;
+  grade?: string;
+  schoolYear?: string;
+  teacherUid: string;
+  teacherName?: string;
+  joinCodeUsed?: string;
+  fullName: string;
+  studentCode?: string; // Mã học sinh tự điền (tùy chọn)
+  requestedStudentCode?: string;
+  notes?: string;
+  status: 'pending' | 'pending_teacher_approval' | 'approved' | 'rejected';
+  assignedUsername?: string;
+  assignedStudentId?: string;
+  createdStudentUid?: string;
+  createdStudentUsername?: string;
+  createdActivationCode?: string;
+  activationCodeExpiresAt?: string;
+  rejectionReason?: string;
+  createdAt: string;
+  reviewedAt?: string;
+  reviewedByUid?: string;
+}
+
+export interface ExcelImportPreviewRow {
+  rowId: string;
+  rowNumber: number;
+  rowIndex?: number;
+  fullName: string;
+  studentCode: string; // Tùy chọn, nếu trống máy chủ tự sinh mã không trùng
+  className: string;
+  notes?: string;
+  status:
+    | 'valid'
+    | 'missing_name'
+    | 'duplicate_code'
+    | 'duplicate_in_file'
+    | 'already_in_class'
+    | 'already_in_system'
+    | 'exceeds_capacity';
+  statusMessage: string;
+}
+
+export interface BatchImportRowError {
+  rowNumber?: number;
+  rowIndex?: number;
+  fullName: string;
+  studentCode?: string;
+  reason: string;
+  message: string;
+  code?: 'MISSING_NAME' | 'DUPLICATE_CODE' | 'ALREADY_IN_CLASS' | 'CLASS_FULL' | 'INVALID_CLASS';
+}
+
 
 export interface TeacherRegistrationRecord {
   id: string;
